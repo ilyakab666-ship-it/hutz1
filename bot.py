@@ -253,16 +253,21 @@ async def buy(q: CallbackQuery):
 async def pay(q: CallbackQuery):
     _, how, key = q.data.split(":")
     it = item_of(key)
-    if not it: return await safe_answer(q, "Тариф не найден", show_alert=True)
+    if not it:
+        return await safe_answer(q, "Тариф не найден", show_alert=True)
     title, price, days = it
     back = Btn(text="◀️ Назад", callback_data=f"buy:{key}")
-   if True:
-        text = ("💳 <b>Оплата картой / СБП</b>\n\n"
-                "Автооплата через RollyPay скоро заработает. Сейчас можно купить код через площадку "
-                "и активировать его в боте.")
-        rows = ([[Btn(text="🛒 Купить код", url=c.SHOP_URL)]] if c.SHOP_URL else []) + \
-               [[Btn(text="🎟 Ввести промокод", callback_data="promo")], [back]]
-    else:
+    text = (
+        "💳 <b>Оплата картой / СБП</b>\n\n"
+        "Автооплата через RollyPay скоро заработает. Сейчас можно купить код через площадку "
+        "и активировать его в боте."
+    )
+    rows = ([[Btn(text="🛒 Купить код", url=c.SHOP_URL)]] if c.SHOP_URL else []) + [
+        [Btn(text="🎟 Ввести промокод", callback_data="promo")],
+        [back],
+    ]
+    await show(q, text, Kb(inline_keyboard=rows))
+    await safe_answer(q)
     
 
 # ---------- нижняя клавиатура (хендлеры стоят выше промокодов: кнопка работает и в режиме ввода кода) ----------
