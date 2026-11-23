@@ -229,7 +229,6 @@ def checkout_view(key: str) -> tuple[str, Kb] | None:
     back = "plans" if key == "x" else f"pk:{c.PLANS[key]['devices']}"
     return text, Kb(inline_keyboard=[
         [Btn(text="💳 Оплатить картой / СБП", callback_data=f"pay:card:{key}")],
-        [Btn(text="🪙 Оплатить криптой", callback_data=f"pay:crypto:{key}")],
         [BTN_PROMO],
         [Btn(text="◀️ Назад", callback_data=back)]])
 
@@ -257,21 +256,14 @@ async def pay(q: CallbackQuery):
     if not it: return await safe_answer(q, "Тариф не найден", show_alert=True)
     title, price, days = it
     back = Btn(text="◀️ Назад", callback_data=f"buy:{key}")
-    if how == "card":
+   if True:
         text = ("💳 <b>Оплата картой / СБП</b>\n\n"
                 "Автооплата через RollyPay скоро заработает. Сейчас можно купить код через площадку "
                 "и активировать его в боте.")
         rows = ([[Btn(text="🛒 Купить код", url=c.SHOP_URL)]] if c.SHOP_URL else []) + \
                [[Btn(text="🎟 Ввести промокод", callback_data="promo")], [back]]
     else:
-        msg = f"Хочу оплатить криптой: {title}, {price} ₽. Мой ID: {q.from_user.id}"
-        text = ("🪙 <b>Оплата криптой</b>\n\n"
-                f"Тариф: <b>{title}</b> — {price} ₽\n\n"
-                "Для оплаты криптовалютой нужно написать в поддержку: пришлём реквизиты и выдадим доступ.\n\n"
-                "Если сообщение не подставилось само, скопируйте его (тап по тексту) и отправьте в поддержку:\n"
-                f"<code>{html.escape(msg)}</code>")
-        rows = [[Btn(text="🆘 Написать в поддержку", url=support_link(msg))], [back]]
-    await show(q, text, Kb(inline_keyboard=rows)); await safe_answer(q)
+    
 
 # ---------- нижняя клавиатура (хендлеры стоят выше промокодов: кнопка работает и в режиме ввода кода) ----------
 @router.message(F.text == RB_MENU)
