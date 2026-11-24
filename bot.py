@@ -75,31 +75,41 @@ async def show(q: CallbackQuery, text: str, kb: Kb):
         await q.message.answer(text, reply_markup=kb)
 
 # ---------- экраны пользователя ----------
+def ch_footer() -> str:
+    return (f"\n\n📢 Наш канал — розыгрыши промокодов, новости и обновления: <a href=\"{c.CHANNEL_URL}\">@hutzvpn</a>"
+            if c.CHANNEL_URL else "")
+
 def welcome() -> str:
-    ch = f"\n📢 Наш канал — розыгрыши промокодов, новости и обновления: <a href=\"{c.CHANNEL_URL}\">@hutzvpn</a>" if c.CHANNEL_URL else ""
     return (f"<b>{c.BRAND}</b>\n{c.TAGLINE}\n\n"
             "🔒 Защищённое VPN-соединение: шифрование трафика, в том числе в публичных Wi-Fi сетях.\n"
             "⚡ Стабильный доступ к высокоскоростным серверам в Европе.\n\n"
             f"🎁 Бесплатный тест: <b>{c.TRIAL_HOURS} ч · {c.TRIAL_GB:g} ГБ</b>\n"
             "Нажмите «Подключить», чтобы начать.\n"
-            f"Есть промокод? Нажмите «Активировать промокод».{ch}")
+            f"Есть промокод? Нажмите «Активировать промокод».{ch_footer()}")
 
 def kb_main() -> Kb:
-    rows = [
+    return Kb(inline_keyboard=[
         [Btn(text="🚀 Подключить", callback_data="connect")],
         [Btn(text="📊 Статус", callback_data="status"), Btn(text="💳 Тарифы", callback_data="plans")],
         [Btn(text="🎟 Активировать промокод", callback_data="promo")],
-    ]
-    if c.CHANNEL_URL:
-        rows.append([Btn(text="📢 Канал · Розыгрыши и новости", url=c.CHANNEL_URL)])
-    rows.append([Btn(text="📄 Политика", url=c.PRIVACY_URL), Btn(text="📜 Соглашение", url=c.TERMS_URL)])
-    rows.append([Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)])
-    return Kb(inline_keyboard=rows)
+        [Btn(text="📄 Документы и поддержка", callback_data="docs")],
+    ])
 
-# нижняя постоянная клавиатура (только Меню и Подключить)
-RB_MENU, RB_CONNECT = "🏠 Меню", "🚀 Подключить"
+def docs_view() -> tuple[str, Kb]:
+    text = ("📄 <b>Документы и поддержка</b>\n\n"
+            "Правила сервиса и связь с нами. Если возникли любые вопросы по оплате или подключению — пишите в поддержку."
+            f"{ch_footer()}")
+    kb = Kb(inline_keyboard=[
+        [Btn(text="📄 Политика", url=c.PRIVACY_URL), Btn(text="📜 Оферта", url=c.TERMS_URL)],
+        [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)],
+        [BACK],
+    ])
+    return text, kb
+
+# нижняя постоянная клавиатура (Меню, Подключить, Тарифы)
+RB_MENU, RB_CONNECT, RB_PLANS = "🏠 Меню", "🚀 Подключить", "💳 Тарифы"
 KB_REPLY = ReplyKeyboardMarkup(
-    keyboard=[[RBtn(text=RB_MENU), RBtn(text=RB_CONNECT)]],
+    keyboard=[[RBtn(text=RB_MENU), RBtn(text=RB_CONNECT), RBtn(text=RB_PLANS)]],
     resize_keyboard=True, is_persistent=True)
 
 KB_SUPPORT = Kb(inline_keyboard=[[Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)]])
@@ -127,21 +137,43 @@ async def menu(q: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(q, welcome(), kb_main()); await safe_answer(q)
 
+@router.callback_query(F.data == "docs")
+async def docs(q: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = docs_view()
+    await show(q, text, kb); await safe_answer(q)
+
 def connect_view(u) -> tuple[str, Kb]:
+    if u["status"] == "banned":
+        return (f"⛔ <b>Доступ заблокирован.</b>\n\nЕсли считаете, что это ошибка — напишите в поддержку.{ch_footer()}",
+                Kb(inline_keyboard=[[Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)], [BACK]]))
+    if u["status"] != "active":
+        title = "⚪️ <b>Срок подписки истёк</b>" if u["status"] == "expired" else "🔒 <b>Подписка не активна</b>"
+        text = (f"{title}\n\n"
+                "Чтобы подключиться к VPN, сначала оформите подписку в разделе «Тарифы» или активируйте промокод.\n\n"
+                f"🆘 Возникли вопросы или не прошла оплата? Напишите в поддержку.{ch_footer()}")
+        kb = Kb(inline_keyboard=[
+            [Btn(text="💳 Тарифы", callback_data="plans")],
+            [Btn(text="🎟 Активировать промокод", callback_data="promo")],
+            [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)],
+            [BACK],
+        ])
+        return text, kb
+
     text = ("<b>Подключение за 3 шага</b>\n\n"
             "1️⃣ Установите <b>Happ</b>\n"
             "2️⃣ Нажмите «🚀 Открыть в Happ» — подписка добавится сама\n"
             "3️⃣ Выберите сервер и включите VPN\n\n"
-            "💡 <b>На мобильном интернете</b> выберите локацию «<b>Нидерланды · Моб. сеть</b>» — она работает стабильнее. "
-            "Для домашнего Wi-Fi подходит «Автовыбор».\n\n"
+            "💡 На мобильном интернете выберите локацию «<b>NL · Мобильная связь</b>» — она работает стабильнее.\n\n"
             f"Ссылка для ручного добавления (тап — скопировать):\n<code>{c.sub_url(u)}</code>\n\n"
-            f"⚠️ <b>Важно:</b> подписка рассчитана на <b>{u['device_limit']} устр.</b> — не передавайте ссылку другим людям, "
-            "иначе слоты устройств займутся и доступ заблокируется. Перед подключением выключите другие VPN.")
+            f"📱 Устройств в подписке: <b>{u['device_limit']}</b>. Перед подключением выключите другие VPN.\n"
+            f"🆘 Если сервер не отвечает или не получается подключиться — напишите в поддержку.{ch_footer()}")
     kb = Kb(inline_keyboard=[
         [Btn(text="🍎 App Store", url=APP_STORE), Btn(text="🤖 Google Play", url=PLAY)],
         [Btn(text="💻 ПК и другие версии", url=ALL_VERSIONS)],
         [Btn(text="🚀 Открыть в Happ", url=f"{c.PUBLIC_URL}/open/{u['token']}")],
         [Btn(text="📷 QR-код", callback_data="qr")],
+        [Btn(text="💳 Тарифы", callback_data="plans"), Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)],
         [BACK]])
     return text, kb
 
@@ -163,15 +195,18 @@ async def qr(q: CallbackQuery):
 
 async def status_view(u) -> tuple[str, Kb]:
     s = u["status"]
+    ch_btn = [[Btn(text="📢 Наш канал · Розыгрыши и новости", url=c.CHANNEL_URL)]] if c.CHANNEL_URL else []
     if s == "new":
-        return (f"🆕 <b>Тест ещё не активирован</b>\n\nДобавьте подписку в Happ — {c.TRIAL_HOURS} ч "
-                "начнут идти с первого подключения.",
-                Kb(inline_keyboard=[[Btn(text="🚀 Подключить", callback_data="connect")], [BACK]]))
-    if s == "banned": return "⛔ <b>Доступ заблокирован.</b>", Kb(inline_keyboard=[[BACK]])
-    if s == "expired":
-        return ("⚪️ <b>Срок доступа истёк</b>\n\nПродлить можно в разделе «Тарифы» или промокодом.",
+        return (f"🆕 <b>Подписка ещё не оформлена</b>\n\nОформите тариф или активируйте промокод, чтобы начать пользоваться VPN.{ch_footer()}",
                 Kb(inline_keyboard=[[Btn(text="💳 Тарифы", callback_data="plans"),
-                                     Btn(text="🎟 Промокод", callback_data="promo")], [BACK]]))
+                                     Btn(text="🎟 Промокод", callback_data="promo")], *ch_btn, [BACK]]))
+    if s == "banned":
+        return (f"⛔ <b>Доступ заблокирован.</b>\n\nПо всем вопросам пишите в поддержку.{ch_footer()}",
+                Kb(inline_keyboard=[[Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)], [BACK]]))
+    if s == "expired":
+        return (f"⚪️ <b>Срок доступа истёк</b>\n\nПродлить можно в разделе «Тарифы» или промокодом.{ch_footer()}",
+                Kb(inline_keyboard=[[Btn(text="💳 Тарифы", callback_data="plans"),
+                                     Btn(text="🎟 Промокод", callback_data="promo")], *ch_btn, [BACK]]))
     try: used = await c.usage(u["key_id"])
     except Exception: used = 0
     plan = "тест" if u["plan"] == "trial" else "оплачено"
@@ -180,11 +215,13 @@ async def status_view(u) -> tuple[str, Kb]:
             f"{bar(used, u['limit_bytes'])}\n{fmt(used)} / {fmt(u['limit_bytes'])}\n\n"
             f"⏳ Осталось: <b>{dur(u['expires_at'] - c.now())}</b>\n"
             f"📱 Устройства: <b>{len(c.devices_of(u))}/{u['device_limit']}</b>{disc_line}\n\n"
-            "💡 <i>На мобильном интернете выберите локацию «Нидерланды · Моб. сеть» — она работает стабильнее.</i>")
-    kb_rows = [[Btn(text="🔄 Обновить", callback_data="status"), Btn(text="💳 Продлить", callback_data="plans")]]
-    if c.CHANNEL_URL:
-        kb_rows.append([Btn(text="📢 Наш канал · Промокоды и новости", url=c.CHANNEL_URL)])
-    kb_rows.append([BACK])
+            "💡 <i>На мобильном интернете выберите локацию «NL · Мобильная связь» — она работает стабильнее.</i>\n"
+            f"🆘 <i>Не работает сервер или возникли сложности? Напишите в поддержку.</i>{ch_footer()}")
+    kb_rows = [
+        [Btn(text="🔄 Обновить", callback_data="status"), Btn(text="💳 Продлить", callback_data="plans")],
+        *ch_btn,
+        [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL), BACK],
+    ]
     return text, Kb(inline_keyboard=kb_rows)
 
 @router.callback_query(F.data == "status")
@@ -231,7 +268,8 @@ def plans_view(disc: int = 0) -> tuple[str, Kb]:
     text = (f"💳 <b>Тарифы {c.BRAND}</b>\n<i>Шаг 1 из 3 — выберите пакет устройств</i>\n\n"
             f"{banner}В каждом тарифе: {includes()}\n\n" + "\n\n".join(blocks) + "\n\n"
             f"➕ Доп. устройство (+1 слот): {_fmt_price(c.EXTRA_DEVICE_RUB, disc)}/мес за каждое.\n\n"
-            "⚡ <i>Активация происходит автоматически сразу после оплаты. При продлении оставшиеся дни суммируются.</i>")
+            "⚡ <i>Активация происходит автоматически сразу после оплаты. При продлении оставшиеся дни суммируются.</i>\n"
+            f"🆘 <i>Если оплата не прошла — напишите в поддержку.</i>{ch_footer()}")
     kb = [[Btn(text=c.PACK_TITLE[d], callback_data=f"pk:{d}")] for d in c.PACKS]
     kb += [[BTN_PROMO], [BACK]]
     return text, Kb(inline_keyboard=kb)
@@ -259,11 +297,12 @@ def checkout_view(key: str, disc: int = 0) -> tuple[str, Kb] | None:
             + f"К оплате: {price_line}")
     if key == "x": text += "\n\n<i>Слот добавляется к вашей активной подписке после оплаты.</i>"
     back = "plans" if key == "x" else f"pk:{c.PLANS[key]['devices']}"
+    text += "\n\n🆘 <i>Если оплата не пройдёт или возникнет ошибка — напишите в поддержку.</i>"
     return text, Kb(inline_keyboard=[
         [Btn(text="🏦 Оплатить через СБП", callback_data=f"pay:sbp:{key}")],
         [Btn(text="₿ Оплатить криптой", callback_data=f"pay:crypto:{key}")],
         [BTN_PROMO],
-        [Btn(text="◀️ Назад", callback_data=back)]])
+        [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL), Btn(text="◀️ Назад", callback_data=back)]])
 
 @router.callback_query(F.data == "plans")
 async def plans(q: CallbackQuery, state: FSMContext):
@@ -316,9 +355,10 @@ async def pay(q: CallbackQuery):
     c.set_payment_link(order_id, d["payment_id"], d["pay_url"])
     text = (f"🧾 <b>Счёт создан</b>\n\nТариф: <b>{title}</b>\nСрок: <b>{days} дн.</b>\nК оплате: <b>{price} ₽</b>\n\n"
             "Нажмите «Оплатить», после оплаты подписка активируется автоматически. "
-            "Если сообщения нет — нажмите «Проверить оплату».")
+            "Если оплата не прошла или подписка не выдалась — нажмите «Проверить оплату» или напишите в поддержку.")
     await show(q, text, Kb(inline_keyboard=[[Btn(text="💳 Оплатить", url=d["pay_url"])],
-                                            [Btn(text="🔄 Проверить оплату", callback_data=f"chk:{order_id}")], [back]]))
+                                            [Btn(text="🔄 Проверить оплату", callback_data=f"chk:{order_id}")],
+                                            [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL), back]]))
     await safe_answer(q)
 
 async def finalize_payment(order_id: str) -> str:
@@ -329,9 +369,9 @@ async def finalize_payment(order_id: str) -> str:
             kb = Kb(inline_keyboard=[[Btn(text="◀️ В админку", callback_data="adm:l:0")]])
             text = "✅ Тестовый платёж на <b>1 ₽</b> прошёл успешно! RollyPay и вебхук работают."
         else:
-            kb = Kb(inline_keyboard=[[Btn(text="🔑 Получить ссылку", callback_data="connect")]])
-            text = (f"✅ Оплата прошла, подписка активирована на <b>{p['days']} дней</b>." if p["plan_key"] != "x"
-                    else "✅ Оплата прошла, добавлен +1 слот устройства.")
+            kb = Kb(inline_keyboard=[[Btn(text="🚀 Подключить", callback_data="connect")]])
+            text = ((f"✅ Оплата прошла, подписка активирована на <b>{p['days']} дней</b>." if p["plan_key"] != "x"
+                     else "✅ Оплата прошла, добавлен +1 слот устройства.") + ch_footer())
         try: await bot.send_message(p["tg_id"], text, reply_markup=kb)
         except Exception: logging.warning("не удалось уведомить %s об оплате %s", p["tg_id"], order_id)
         await notify_admins(f"💰 Оплата {p['amount']} ₽ · {p['plan_key']} · tg {p['tg_id']} · {p['method']}")
@@ -367,6 +407,13 @@ async def rb_menu(m: Message, state: FSMContext):
 async def rb_connect(m: Message, state: FSMContext):
     await state.clear()
     text, kb = connect_view(await _ensure_synced(m.from_user.id, m.from_user.username))
+    await m.answer(text, reply_markup=kb)
+
+@router.message(F.text == RB_PLANS)
+async def rb_plans(m: Message, state: FSMContext):
+    await state.clear()
+    u = await _ensure_synced(m.from_user.id, m.from_user.username)
+    text, kb = plans_view(u["discount_pct"] or 0)
     await m.answer(text, reply_markup=kb)
 
 # ---------- промокоды ----------
@@ -410,7 +457,7 @@ async def do_redeem(m: Message, raw: str) -> bool:
         await m.answer(f"✅ <b>Промокод активирован!</b>\n\n➕ Добавлено: <b>{p['days']} дн.</b>\n"
                        f"📱 Устройств в подписке: <b>{u['device_limit']}</b>\n"
                        f"⏳ Действует до: <b>{date(u['expires_at'])}</b>\n\n"
-                       "Откройте «Подключить», чтобы добавить подписку в Happ.",
+                       f"Откройте «Подключить», чтобы добавить подписку в Happ.{ch_footer()}",
                        reply_markup=Kb(inline_keyboard=[[Btn(text="🚀 Подключить", callback_data="connect")],
                                                         [Btn(text="📊 Статус", callback_data="status")]]))
         return True
@@ -443,7 +490,7 @@ def kb_renew() -> Kb:
     return Kb(inline_keyboard=[[Btn(text="💳 Продлить", callback_data="plans")]])
 
 async def send_notice(tg_id: int, text: str):
-    try: await bot.send_message(tg_id, text, reply_markup=kb_renew())
+    try: await bot.send_message(tg_id, text + ch_footer(), reply_markup=kb_renew())
     except Exception: logging.info("не удалось отправить уведомление %s", tg_id)
 
 async def notify_admins(text: str):

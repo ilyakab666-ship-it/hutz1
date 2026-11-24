@@ -92,10 +92,12 @@ app = FastAPI(lifespan=lifespan)
 
 
 def _clean_remark(name: str) -> str:
-    # "Нидерланды #1 · Билайн (через Москву)" -> "Нидерланды #1 · Моб. сеть" (ровно 25 символов, без запрещённых слов)
-    name = re.sub(r"билайн\s*\(через\s*москву\)", "Моб. сеть", name, flags=re.I)
-    name = re.sub(r"\(через\s*москву\)", "", name, flags=re.I)
-    name = re.sub(r"билайн", "Моб. сеть", name, flags=re.I)
+    # "Нидерланды #1 · Билайн (через Москву)" -> "NL #1 · Мобильная связь" (23 символа)
+    if re.search(r"билайн|через\s*москву", name, flags=re.I):
+        name = re.sub(r"нидерланды", "NL", name, flags=re.I)
+        name = re.sub(r"билайн\s*\(через\s*москву\)", "Мобильная связь", name, flags=re.I)
+        name = re.sub(r"\(через\s*москву\)", "", name, flags=re.I)
+        name = re.sub(r"билайн", "Мобильная связь", name, flags=re.I)
     return re.sub(r"\s{2,}", " ", name).strip()
 
 def _is_redundant_auto(name: str) -> bool:
@@ -198,7 +200,7 @@ async def sub(token: str, request: Request):
     hdrs["profile-title"] = os.getenv("HAPP_TITLE", default_title).strip()[:30]
     hdrs["support-url"] = c.SUPPORT_URL           # иконка поддержки внутри Happ
     hdrs["profile-update-interval"] = "1"         # автообновление раз в час
-    ann = os.getenv("HAPP_ANNOUNCE", "💡 Для мобильного интернета выберите «Нидерланды · Моб. сеть»").strip()
+    ann = os.getenv("HAPP_ANNOUNCE", "💡 На моб. интернете выберите «NL · Мобильная связь». Помощь: нажмите сюда → поддержка").strip()
     if ann:
         hdrs["announce"] = "base64:" + base64.b64encode(ann.encode("utf-8")).decode()
         hdrs["announce-url"] = c.SUPPORT_URL
