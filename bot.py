@@ -84,29 +84,29 @@ def kb_main() -> Kb:
         [Btn(text="📄 Политика", url=c.PRIVACY_URL), Btn(text="📜 Соглашение", url=c.TERMS_URL)],
         [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)]])
 
-# нижняя постоянная клавиатура (быстрый доступ); тексты кнопок обрабатываются хендлерами ниже
-RB_MENU, RB_CONNECT, RB_STATUS = "🏠 Меню", "🚀 Подключить", "📊 Статус"
-RB_PLANS, RB_PROMO, RB_DOCS = "💳 Тарифы", "🎟 Промокод", "📄 Документы и поддержка"
+# нижняя постоянная клавиатура (только Меню и Подключить)
+RB_MENU, RB_CONNECT = "🏠 Меню", "🚀 Подключить"
 KB_REPLY = ReplyKeyboardMarkup(
-    keyboard=[[RBtn(text=RB_MENU), RBtn(text=RB_CONNECT)],
-              [RBtn(text=RB_STATUS), RBtn(text=RB_PLANS)],
-              [RBtn(text=RB_PROMO)],
-              [RBtn(text=RB_DOCS)]],
+    keyboard=[[RBtn(text=RB_MENU), RBtn(text=RB_CONNECT)]],
     resize_keyboard=True, is_persistent=True)
-
-def docs_view() -> tuple[str, Kb]:
-    return ("📄 <b>Документы и поддержка</b>\n\nПравила сервиса и связь с нами.",
-            Kb(inline_keyboard=[[Btn(text="📄 Политика", url=c.PRIVACY_URL), Btn(text="📜 Соглашение", url=c.TERMS_URL)],
-                                [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)]]))
 
 KB_SUPPORT = Kb(inline_keyboard=[[Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)]])
 
 BACK = Btn(text="◀️ Назад", callback_data="menu")
 
+async def _ensure_synced(tg_id: int, username: str | None = None):
+    u = c.ensure_user(tg_id, username)
+    if u["status"] == "new":
+        try:
+            u = await c.sync_user_from_h1(tg_id)
+        except Exception:
+            logging.exception("sync_user_from_h1 failed for %s", tg_id)
+    return u
+
 @router.message(Command("start"))
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    c.ensure_user(m.from_user.id, m.from_user.username)
+    await _ensure_synced(m.from_user.id, m.from_user.username)
     await m.answer("👇 Кнопки быстрого доступа — внизу экрана", reply_markup=KB_REPLY)
     await m.answer(welcome(), reply_markup=kb_main())
 
@@ -133,7 +133,7 @@ def connect_view(u) -> tuple[str, Kb]:
 
 @router.callback_query(F.data == "connect")
 async def connect(q: CallbackQuery):
-    text, kb = connect_view(c.ensure_user(q.from_user.id, q.from_user.username))
+    text, kb = connect_view(await _ensure_synced(q.from_user.id, q.from_user.username))
     await show(q, text, kb); await safe_answer(q)
 
 @router.callback_query(F.data == "qr")
@@ -169,12 +169,12 @@ async def status_view(u) -> tuple[str, Kb]:
 
 @router.callback_query(F.data == "status")
 async def status(q: CallbackQuery):
-    text, kb = await status_view(c.ensure_user(q.from_user.id, q.from_user.username))
+    text, kb = await status_view(await _ensure_synced(q.from_user.id, q.from_user.username))
     await show(q, text, kb); await safe_answer(q)
 
 @router.message(Command("status"))
 async def status_cmd(m: Message):
-    text, kb = await status_view(c.ensure_user(m.from_user.id, m.from_user.username))
+    text, kb = await status_view(await _ensure_synced(m.from_user.id, m.from_user.username))
     await m.answer(text, reply_markup=kb)
 
 # ---------- витрина: Тарифы / Купить (3 шага) ----------
@@ -289,9 +289,13 @@ async def finalize_payment(order_id: str) -> str:
     """Зачисляет оплаченный заказ (идемпотентно) и пишет пользователю. Возвращает ok | already | unknown."""
     st, p = await c.fulfill_payment(order_id)
     if st == "ok":
-        kb = Kb(inline_keyboard=[[Btn(text="🔑 Получить ссылку", callback_data="connect")]])
-        text = (f"✅ Оплата прошла, подписка активирована на <b>{p['days']} дней</b>." if p["plan_key"] != "x"
-                else "✅ Оплата прошла, добавлен +1 слот устройства.")
+        if p["plan_key"] == "test1":
+            kb = Kb(inline_keyboard=[[Btn(text="◀️ В админку", callback_data="adm:l:0")]])
+            text = "✅ Тестовый платёж на <b>1 ₽</b> прошёл успешно! RollyPay и вебхук работают."
+        else:
+            kb = Kb(inline_keyboard=[[Btn(text="🔑 Получить ссылку", callback_data="connect")]])
+            text = (f"✅ Оплата прошла, подписка активирована на <b>{p['days']} дней</b>." if p["plan_key"] != "x"
+                    else "✅ Оплата прошла, добавлен +1 слот устройства.")
         try: await bot.send_message(p["tg_id"], text, reply_markup=kb)
         except Exception: logging.warning("не удалось уведомить %s об оплате %s", p["tg_id"], order_id)
         await notify_admins(f"💰 Оплата {p['amount']} ₽ · {p['plan_key']} · tg {p['tg_id']} · {p['method']}")
@@ -306,7 +310,7 @@ async def check_pay(q: CallbackQuery):
     except Exception:
         logging.exception("rollypay status")
         return await safe_answer(q, "Не удалось проверить, попробуйте позже", show_alert=True)
-    if info.get("status") == "paid" and str(info.get("amount")) and float(info["amount"]) == float(p["amount"]):
+    if info.get("status") == "paid" and str(info.get("amount")) and float(info["amount"]) + 0.001 >= float(p["amount"]):
         try: await finalize_payment(p["order_id"])
         except Exception:
             logging.exception("finalize")
@@ -320,34 +324,14 @@ async def check_pay(q: CallbackQuery):
 @router.message(F.text == RB_MENU)
 async def rb_menu(m: Message, state: FSMContext):
     await state.clear()
-    c.ensure_user(m.from_user.id, m.from_user.username)
+    await _ensure_synced(m.from_user.id, m.from_user.username)
     await m.answer(welcome(), reply_markup=kb_main())
 
 @router.message(F.text == RB_CONNECT)
 async def rb_connect(m: Message, state: FSMContext):
     await state.clear()
-    text, kb = connect_view(c.ensure_user(m.from_user.id, m.from_user.username))
+    text, kb = connect_view(await _ensure_synced(m.from_user.id, m.from_user.username))
     await m.answer(text, reply_markup=kb)
-
-@router.message(F.text == RB_STATUS)
-async def rb_status(m: Message, state: FSMContext):
-    await state.clear()
-    await status_cmd(m)
-
-@router.message(F.text == RB_PLANS)
-async def rb_plans(m: Message, state: FSMContext):
-    await state.clear()
-    text, kb = plans_view(); await m.answer(text, reply_markup=kb)
-
-@router.message(F.text == RB_PROMO)
-async def rb_promo(m: Message, state: FSMContext):
-    await state.set_state(PromoSt.code)
-    await m.answer(PROMO_PROMPT, reply_markup=KB_CANCEL)
-
-@router.message(F.text == RB_DOCS)
-async def rb_docs(m: Message, state: FSMContext):
-    await state.clear()
-    text, kb = docs_view(); await m.answer(text, reply_markup=kb)
 
 # ---------- промокоды ----------
 KB_CANCEL = Kb(inline_keyboard=[[Btn(text="✖️ Отмена", callback_data="menu")]])
@@ -424,6 +408,19 @@ async def notify_admins(text: str):
 
 c.alert_hook = notify_admins   # core.alert() шлёт сюда сообщения о недоступности панели
 
+async def send_db_backup(chat_id: int | None = None, reason: str = "Автобэкап") -> bool:
+    target = chat_id or c.BACKUP_CHAT_ID
+    if not target: return False
+    data = c.backup_db_bytes()
+    ts = time.strftime("%Y%m%d_%H%M", time.localtime())
+    users_n = c.db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    active_n = c.db.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0]
+    caption = (f"💾 <b>{reason} БД</b>\n"
+               f"Пользователей: <b>{users_n}</b> (активных: <b>{active_n}</b>)\n"
+               "<i>Чтобы восстановить после пересборки — ответьте на этот файл командой /restore</i>")
+    await bot.send_document(target, BufferedInputFile(data, f"hutz_vpn_{ts}.db"), caption=caption)
+    return True
+
 # ---------- админка ----------
 def label(u) -> str:
     name = f"@{u['username']}" if u["username"] else str(u["tg_id"])
@@ -440,6 +437,8 @@ def list_view(page: int) -> tuple[str, Kb]:
     kb.append(nav)
     kb.append([Btn(text="🔍 Найти пользователя", callback_data="adm:find")])
     kb.append([Btn(text="🎟 Генератор промокодов", callback_data="adm:pg")])
+    kb.append([Btn(text="🧪 Тест (1 ₽)", callback_data="adm:testpay")])
+    kb.append([Btn(text="🔄 Синхр. H1", callback_data="adm:sync"), Btn(text="💾 Бэкап БД", callback_data="adm:backup")])
     active = sum(r["status"] == "active" for r in rows)
     return f"👥 <b>Пользователи</b>: {len(rows)}, активных: {active}", Kb(inline_keyboard=kb)
 
@@ -526,6 +525,52 @@ async def adm(q: CallbackQuery, state: FSMContext):
     await state.clear()
     if act == "l":
         text, kb = list_view(int(p[2])); await show(q, text, kb); return await safe_answer(q)
+    if act == "sync":
+        try:
+            st = await c.sync_from_h1()
+            note = f"Синхронизировано: +{st['created']} новых, {st['updated']} обновл. (всего в H1: {st['total']})"
+        except Exception as e:
+            logging.exception("adm sync")
+            note = f"Ошибка синхронизации: {e}"
+        text, kb = list_view(0); await show(q, text, kb); return await safe_answer(q, note[:190], show_alert=True)
+    if act == "backup":
+        try:
+            await send_db_backup(q.from_user.id, reason="Ручной бэкап")
+            return await safe_answer(q, "💾 Файл БД отправлен в чат")
+        except Exception as e:
+            logging.exception("adm backup")
+            return await safe_answer(q, f"Ошибка бэкапа: {e}"[:190], show_alert=True)
+    if act == "testpay":
+        mode = "SANDBOX (ROLLYPAY_TEST=1)" if rp.TEST_MODE else "БОЕВОЙ (реальный 1 ₽)"
+        kb = Kb(inline_keyboard=[
+            [Btn(text="🏦 Тест СБП — 1 ₽", callback_data="adm:tp:sbp")],
+            [Btn(text="₿ Тест Крипта — 1 ₽", callback_data="adm:tp:crypto")],
+            [Btn(text="◀️ К списку", callback_data="adm:l:0")]])
+        await show(q, f"🧪 <b>Тест оплаты (1 ₽)</b>\nРежим RollyPay: <b>{mode}</b>\n\n"
+                      "Подписка при тестовом платеже не изменяется. Выберите способ:", kb)
+        return await safe_answer(q)
+    if act == "tp":
+        how = p[2]
+        if how not in rp.METHODS: return await safe_answer(q, "Неизвестный способ", show_alert=True)
+        if not rp.ENABLED:
+            return await safe_answer(q, "RollyPay не настроен: проверьте ROLLYPAY_API_KEY и ROLLYPAY_SIGNING_SECRET", show_alert=True)
+        c.ensure_user(q.from_user.id, q.from_user.username)
+        order_id = uuid.uuid4().hex
+        c.create_payment_row(order_id, q.from_user.id, "test1", 0, 0, 1, how)
+        try:
+            d = await rp.create_payment(order_id, 1, how, f"{c.BRAND}: Тестовый платёж 1 ₽", q.from_user.id)
+        except Exception as e:
+            logging.exception("rollypay test create")
+            c.mark_payment_failed(order_id)
+            return await safe_answer(q, f"Ошибка RollyPay: {e}"[:190], show_alert=True)
+        c.set_payment_link(order_id, d["payment_id"], d["pay_url"])
+        text = (f"🧪 <b>Тестовый счёт создан</b>\n\nСумма: <b>1 ₽</b>\nСпособ: <b>{how.upper()}</b>\n"
+                f"Order ID: <code>{order_id}</code>\n\nОплатите по кнопке ниже и проверьте приход вебхука.")
+        kb = Kb(inline_keyboard=[
+            [Btn(text="💳 Оплатить 1 ₽", url=d["pay_url"])],
+            [Btn(text="🔄 Проверить оплату", callback_data=f"chk:{order_id}")],
+            [Btn(text="◀️ К списку", callback_data="adm:l:0")]])
+        await show(q, text, kb); return await safe_answer(q)
     if act == "pg":   # генератор промокодов: выбор тарифа
         text, kb = promo_menu_view(); await show(q, text, kb); return await safe_answer(q)
     if act == "pt":   # ... выбор количества
@@ -586,6 +631,34 @@ async def grant(m: Message, command: CommandObject):
     except ValueError: return await m.answer("/grant tg_id дней гб [устройств]")
     await c.grant(int(a[0]), a[1], a[2], devices); await m.answer("Готово")
 
+@router.message(Command("backup"), admin)
+async def backup_cmd(m: Message):
+    await send_db_backup(m.chat.id, reason="Ручной бэкап")
+
+async def _do_restore(m: Message, doc):
+    if not doc or not (doc.file_name or "").endswith((".db", ".sqlite", ".sqlite3")):
+        return await m.answer("❌ Пришлите файл базы данных (<code>.db</code>) с подписью <code>/restore</code> "
+                              "или ответьте командой <code>/restore</code> на ранее присланный бэкап.")
+    buf = io.BytesIO()
+    await bot.download(doc, destination=buf)
+    try:
+        st = await c.restore_db_bytes(buf.getvalue())
+    except Exception as e:
+        logging.exception("restore_db_bytes")
+        return await m.answer(f"❌ Не удалось восстановить БД: <code>{html.escape(str(e))}</code>")
+    await m.answer(f"✅ <b>БД восстановлена!</b>\n"
+                   f"Пользователей: <b>{st['users']}</b> (активных: <b>{st['active']}</b>)\n"
+                   f"Оплат: <b>{st['payments']}</b> · Свободных промокодов: <b>{st['promos']}</b>")
+
+@router.message(Command("restore"), admin)
+async def restore_cmd(m: Message):
+    doc = m.document or (m.reply_to_message.document if m.reply_to_message else None)
+    await _do_restore(m, doc)
+
+@router.message(admin, F.document, F.caption.startswith("/restore"))
+async def restore_doc_caption(m: Message):
+    await _do_restore(m, m.document)
+
 # ---------- сервис ----------
 async def setup_commands():
     user_cmds = [BotCommand(command="start", description="Главное меню"),
@@ -594,7 +667,7 @@ async def setup_commands():
     await bot.set_my_commands(user_cmds, scope=BotCommandScopeDefault())
     for aid in c.ADMINS:
         try:
-            await bot.set_my_commands(user_cmds + [BotCommand(command="admin", description="Панель администратора")],
+            await bot.set_my_commands(user_cmds + [BotCommand(command="admin", description="Панель администратора"), BotCommand(command="backup", description="Скачать бэкап БД")],
                                       scope=BotCommandScopeChat(chat_id=aid))
         except Exception:
             logging.warning("не удалось задать команды админу %s (он должен сначала написать боту)", aid)

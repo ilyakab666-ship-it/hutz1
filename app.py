@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import core as c
 import rollypay as rp
-from bot import bot, dp, dur, finalize_payment, notify_admins, send_notice, setup_commands
+from bot import bot, dp, dur, finalize_payment, notify_admins, send_db_backup, send_notice, setup_commands
 
 logging.basicConfig(level=logging.INFO)
 
@@ -46,13 +46,21 @@ async def job_traffic():
                                  f"({used / c.GB:.2f} из {limit / c.GB:.2f} ГБ). "
                                  "Когда лимит закончится, интернет через VPN перестанет работать")
 
+async def job_backup():
+    if c.BACKUP_HOURS <= 0 or not c.BACKUP_CHAT_ID: return
+    if not c.db.execute("SELECT 1 FROM users LIMIT 1").fetchone(): return
+    await send_db_backup(c.BACKUP_CHAT_ID, reason="Автобэкап")
+
 async def background_loop():
-    """Раз в минуту: напоминание «скоро конец» (платным — за 24 ч) и истёкшие подписки; раз в 5 минут — порог трафика."""
+    """Раз в минуту: напоминание «скоро конец» и истёкшие подписки; раз в 5 мин — трафик; раз в BACKUP_HOURS ч — бэкап БД."""
     tick = 0
+    backup_every = max(1, int(c.BACKUP_HOURS * 60)) if c.BACKUP_HOURS > 0 else 0
     while True:
         await step("expiring", job_expiring)
         await step("expired", job_expired)
         if tick % 5 == 0: await step("traffic", job_traffic)
+        if backup_every and tick > 0 and tick % backup_every == 0:
+            await step("backup", job_backup)
         tick += 1
         await asyncio.sleep(60)
 
@@ -63,6 +71,12 @@ def _task_done(t: asyncio.Task):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logging.info("SQLite DB_PATH: %s", c.DB_PATH)
+    try:
+        synced = await c.sync_from_h1()
+        logging.info("H1 sync on startup: %s", synced)
+    except Exception:
+        logging.exception("sync_from_h1")
     try: await setup_commands()
     except Exception: logging.exception("set_my_commands")
     tasks = [asyncio.create_task(dp.start_polling(bot, handle_signals=False)),

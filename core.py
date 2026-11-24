@@ -1,6 +1,7 @@
 """Конфиг, БД, клиент панели H1Cloud и бизнес-логика (триал, устройства по x-hwid, промокоды, уведомления).
 В БД: key_id = имя клиента в панели, access_url = sub_url панели (наружу не отдаётся)."""
-import asyncio, hashlib, json, logging, math, os, re, secrets, sqlite3, time
+import asyncio, hashlib, json, logging, math, os, re, secrets, sqlite3, tempfile, time
+from datetime import datetime
 from urllib.parse import quote, urljoin
 import httpx
 
@@ -12,6 +13,9 @@ def _norm_url(u: str) -> str:
 
 PUBLIC_URL = _norm_url(os.environ["PUBLIC_URL"])
 ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+_bc = os.getenv("BACKUP_CHAT_ID", "").strip()
+BACKUP_CHAT_ID = int(_bc) if _bc.lstrip("-").isdigit() else (min(ADMINS) if ADMINS else 0)
+BACKUP_HOURS = float(os.getenv("BACKUP_HOURS", "6"))
 TRIAL_HOURS = int(os.getenv("TRIAL_HOURS", "24"))
 GB = 1024 ** 3
 TRIAL_GB = float(os.getenv("TRIAL_GB", "3"))
@@ -58,41 +62,98 @@ H1_INBOUNDS = [x.strip() for x in os.getenv("H1_INBOUND_IDS", "").split(",") if 
 H1_CHANNELS = [x.strip() for x in os.getenv("H1_CHANNELS", "").split(",") if x.strip()]
 
 # ---------- БД ----------
-DB_PATH = os.getenv("DB_PATH", "vpn.db")
+def _resolve_db_path() -> str:
+    env_p = os.getenv("DB_PATH", "").strip()
+    if env_p:
+        return env_p
+    for d in ("/data", "/var/data", "/storage"):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "vpn.db")
+    return "vpn.db"
+
+DB_PATH = _resolve_db_path()
 os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)   # папка под БД (например /data/vpn.db)
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.execute("PRAGMA journal_mode=WAL"); db.execute("PRAGMA busy_timeout=5000")
-db.executescript("""
-CREATE TABLE IF NOT EXISTS users(
-  tg_id INTEGER PRIMARY KEY, token TEXT UNIQUE NOT NULL,
-  hwid TEXT,                           -- устарело: мигрирует в devices
-  key_id TEXT, access_url TEXT, plan TEXT DEFAULT 'trial',
-  limit_bytes INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0,
-  status TEXT DEFAULT 'new',           -- new | active | expired | banned
-  created_at INTEGER);
-CREATE TABLE IF NOT EXISTS hwids(hwid TEXT PRIMARY KEY, tg_id INTEGER, used_at INTEGER);
-CREATE TABLE IF NOT EXISTS device_info(      -- модель/ОС устройства по x-hwid (для админки)
-  hwid TEXT PRIMARY KEY, tg_id INTEGER, model TEXT, os TEXT, first_seen INTEGER, last_seen INTEGER);
-CREATE TABLE IF NOT EXISTS promo_codes(
-  code TEXT PRIMARY KEY, days INTEGER NOT NULL, devices INTEGER NOT NULL,
-  is_used INTEGER DEFAULT 0, used_by INTEGER, created_at INTEGER, used_at INTEGER);
-CREATE TABLE IF NOT EXISTS payments(
-  order_id TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, plan_key TEXT NOT NULL,
-  days INTEGER NOT NULL, devices INTEGER NOT NULL, amount INTEGER NOT NULL, method TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',      -- pending | paid | failed
-  rp_payment_id TEXT, pay_url TEXT, created_at INTEGER, paid_at INTEGER);
-""")
-for _ddl in ("username TEXT", "devices TEXT DEFAULT '[]'", "device_limit INTEGER DEFAULT 1",
-             "notified_exp INTEGER DEFAULT 0", "notified_traffic INTEGER DEFAULT 0"):
-    try: db.execute(f"ALTER TABLE users ADD COLUMN {_ddl}")   # автомиграция старых БД
-    except sqlite3.OperationalError: pass
-for _r in db.execute("SELECT tg_id,hwid,devices FROM users WHERE hwid IS NOT NULL AND hwid!=''").fetchall():
-    try: _devs = json.loads(_r["devices"] or "[]")
-    except ValueError: _devs = []
-    if _r["hwid"] not in _devs: _devs.append(_r["hwid"])
-    db.execute("UPDATE users SET devices=?, hwid=NULL WHERE tg_id=?", (json.dumps(_devs), _r["tg_id"]))
-db.commit()
+
+def _init_db():
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+      tg_id INTEGER PRIMARY KEY, token TEXT UNIQUE NOT NULL,
+      hwid TEXT,                           -- устарело: мигрирует в devices
+      key_id TEXT, access_url TEXT, plan TEXT DEFAULT 'trial',
+      limit_bytes INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'new',           -- new | active | expired | banned
+      created_at INTEGER);
+    CREATE TABLE IF NOT EXISTS hwids(hwid TEXT PRIMARY KEY, tg_id INTEGER, used_at INTEGER);
+    CREATE TABLE IF NOT EXISTS device_info(      -- модель/ОС устройства по x-hwid (для админки)
+      hwid TEXT PRIMARY KEY, tg_id INTEGER, model TEXT, os TEXT, first_seen INTEGER, last_seen INTEGER);
+    CREATE TABLE IF NOT EXISTS promo_codes(
+      code TEXT PRIMARY KEY, days INTEGER NOT NULL, devices INTEGER NOT NULL,
+      is_used INTEGER DEFAULT 0, used_by INTEGER, created_at INTEGER, used_at INTEGER);
+    CREATE TABLE IF NOT EXISTS payments(
+      order_id TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, plan_key TEXT NOT NULL,
+      days INTEGER NOT NULL, devices INTEGER NOT NULL, amount INTEGER NOT NULL, method TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',      -- pending | paid | failed
+      rp_payment_id TEXT, pay_url TEXT, created_at INTEGER, paid_at INTEGER);
+    """)
+    for _ddl in ("username TEXT", "devices TEXT DEFAULT '[]'", "device_limit INTEGER DEFAULT 1",
+                 "notified_exp INTEGER DEFAULT 0", "notified_traffic INTEGER DEFAULT 0"):
+        try: db.execute(f"ALTER TABLE users ADD COLUMN {_ddl}")   # автомиграция старых БД
+        except sqlite3.OperationalError: pass
+    for _r in db.execute("SELECT tg_id,hwid,devices FROM users WHERE hwid IS NOT NULL AND hwid!=''").fetchall():
+        try: _devs = json.loads(_r["devices"] or "[]")
+        except ValueError: _devs = []
+        if _r["hwid"] not in _devs: _devs.append(_r["hwid"])
+        db.execute("UPDATE users SET devices=?, hwid=NULL WHERE tg_id=?", (json.dumps(_devs), _r["tg_id"]))
+    db.commit()
+
+_init_db()
+
+def backup_db_bytes() -> bytes:
+    """Создаёт консистентный снимок SQLite (безопасно для WAL) и возвращает его байтами."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            db.backup(dst)
+        finally:
+            dst.close()
+        with open(tmp, "rb") as f:
+            return f.read()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+async def restore_db_bytes(data: bytes) -> dict:
+    """Проверяет загруженный файл SQLite и атомарно заливает его поверх текущей БД."""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        src_conn = sqlite3.connect(tmp)
+        try:
+            tables = {r[0] for r in src_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "users" not in tables:
+                raise ValueError("В файле нет таблицы users — это не бэкап бота.")
+            async with _lock:
+                src_conn.backup(db)
+                _init_db()
+                _h1_miss_cache.clear()
+        finally:
+            src_conn.close()
+        return {
+            "users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "active": db.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0],
+            "payments": db.execute("SELECT COUNT(*) FROM payments WHERE status='paid'").fetchone()[0],
+            "promos": db.execute("SELECT COUNT(*) FROM promo_codes WHERE is_used=0").fetchone()[0],
+        }
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 def now() -> int: return int(time.time())
 def get_user(tg_id): return db.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
@@ -202,6 +263,113 @@ async def usage(key_id) -> int:
     cl = await h1_get(key_id)
     return int(float(cl.get("traffic_used_gb") or 0) * GB)
 
+_h1_miss_cache: dict[int, float] = {}   # tg_id -> ts последнего 404 в панели (чтобы не дёргать H1 на каждый клик)
+_H1_MISS_TTL = 300
+
+def _parse_ts(val) -> int:
+    if val is None or val == "": return 0
+    if isinstance(val, (int, float)):
+        v = int(val)
+        return v // 1000 if v > 10**12 else v
+    s = str(val).strip()
+    if s.isdigit():
+        v = int(s)
+        return v // 1000 if v > 10**12 else v
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+def _extract_clients(resp) -> list[dict]:
+    if isinstance(resp, list): return [x for x in resp if isinstance(x, dict)]
+    if isinstance(resp, dict):
+        for k in ("clients", "items", "data", "results"):
+            if isinstance(resp.get(k), list):
+                return [x for x in resp[k] if isinstance(x, dict)]
+    return []
+
+def _upsert_from_h1_client(tg_id: int, cl: dict) -> str:
+    """Создаёт или восстанавливает пользователя в локальной БД по данным клиента из H1Cloud.
+    Не затирает уже активных/забаненных пользователей; защищает от абуза триала после пересборки."""
+    name = cl.get("name") or f"tg{tg_id}"
+    exp = _parse_ts(cl.get("expires_at") or cl.get("expire_at") or cl.get("expiry_time"))
+    gb = float(cl.get("traffic_limit_gb") or 0)
+    limit_bytes = int(gb * GB) if gb > 0 else TRIAL_BYTES
+    raw_url = cl.get("sub_url") or cl.get("subscription_url") or ""
+    url = urljoin(H1_BASES[0] + "/", raw_url) if raw_url else ""
+    t = now()
+    disabled = cl.get("enabled") is False or cl.get("active") is False or cl.get("status") in ("disabled", "expired", "banned")
+    status = "active" if (exp > t and not disabled) else "expired"
+    plan = "paid" if (gb > TRIAL_GB + 0.1 or (exp - t) > TRIAL_HOURS * 3600 + 3600) else "trial"
+
+    u = get_user(tg_id)
+    if not u:
+        db.execute(
+            "INSERT INTO users(tg_id,token,key_id,access_url,plan,limit_bytes,expires_at,status,created_at,device_limit) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (tg_id, secrets.token_urlsafe(16), name, url, plan, limit_bytes, exp, status, t, DEFAULT_DEVICES))
+        return "created"
+    if u["status"] == "banned":
+        return "skipped"
+    if u["status"] == "new" or not u["key_id"] or (status == "active" and exp > (u["expires_at"] or 0)):
+        db.execute(
+            "UPDATE users SET key_id=?, access_url=COALESCE(NULLIF(?,''),access_url), plan=?, "
+            "limit_bytes=?, expires_at=?, status=? WHERE tg_id=?",
+            (name, url, plan, limit_bytes, exp, status, tg_id))
+        return "updated"
+    return "skipped"
+
+async def sync_from_h1() -> dict:
+    """Подтягивает всех клиентов вида tg<id> из панели H1Cloud в локальную БД (чтобы админка не была пустой после пересборки)."""
+    res = {"created": 0, "updated": 0, "skipped": 0, "total": 0}
+    try:
+        raw = await _h1("GET", "/clients")
+    except H1Error as e:
+        logging.warning("sync_from_h1: панель ответила %s", e)
+        return res
+    clients = _extract_clients(raw)
+    res["total"] = len(clients)
+    async with _lock:
+        for cl in clients:
+            name = str(cl.get("name") or "")
+            m = re.fullmatch(r"tg(\d+)", name)
+            if not m: continue
+            tg_id = int(m.group(1))
+            if not (cl.get("sub_url") or cl.get("subscription_url")):
+                try: cl = await h1_get(name)
+                except Exception: pass
+            act = _upsert_from_h1_client(tg_id, cl)
+            res[act] += 1
+            _h1_miss_cache.pop(tg_id, None)
+        db.commit()
+    return res
+
+async def _sync_user_from_h1_nolock(tg_id: int, force: bool = False):
+    """Проверяет, есть ли клиент tg<tg_id> уже в H1Cloud. Вызывать под _lock.
+    Если есть — восстанавливает реальную подписку в БД и блокирует повторный триал."""
+    u = get_user(tg_id)
+    if not u or u["status"] != "new":
+        return u
+    t = time.time()
+    if not force and t - _h1_miss_cache.get(tg_id, 0) < _H1_MISS_TTL:
+        return u
+    name = f"tg{tg_id}"
+    try:
+        cl = await h1_get(name)
+    except H1Error as e:
+        if e.status == 404:
+            _h1_miss_cache[tg_id] = t
+            return u
+        raise
+    _upsert_from_h1_client(tg_id, cl)
+    db.commit()
+    _h1_miss_cache.pop(tg_id, None)
+    return get_user(tg_id)
+
+async def sync_user_from_h1(tg_id: int, force: bool = False):
+    async with _lock:
+        return await _sync_user_from_h1_nolock(tg_id, force=force)
+
 _FWD_REQ = ("x-hwid", "user-agent", "x-device-os", "x-ver-os", "x-device-model", "accept-language")
 _FWD_RESP = {"subscription-userinfo", "profile-title", "profile-update-interval", "profile-web-page-url",
              "support-url", "announce", "announce-url", "routing", "content-disposition", "content-type"}
@@ -226,7 +394,14 @@ async def resolve_sub(token: str, hwid: str, model: str = "", os_name: str = "")
         if u["status"] in ("banned", "expired"): return u["status"], u
         devs = devices_of(u)
 
-        if u["status"] == "new":  # первое подключение = старт триала
+        if u["status"] == "new":  # первое подключение = сначала сверяем с H1Cloud (анти-абуз после пересборки)
+            try:
+                u = await _sync_user_from_h1_nolock(u["tg_id"], force=True)
+            except Exception:
+                logging.exception("sync_user_from_h1 failed for %s", u["tg_id"])
+            if u["status"] in ("banned", "expired"):
+                return u["status"], u
+        if u["status"] == "new":  # точно новый клиент — запускаем триал
             owner = db.execute("SELECT tg_id FROM hwids WHERE hwid=?", (hwid,)).fetchone()
             if owner and owner["tg_id"] != u["tg_id"]: return "hwid_used", u   # анти-абуз триала
             name, exp = f"tg{u['tg_id']}", now() + TRIAL_HOURS * 3600
@@ -235,6 +410,7 @@ async def resolve_sub(token: str, hwid: str, model: str = "", os_name: str = "")
             db.execute("UPDATE users SET key_id=?,access_url=?,limit_bytes=?,expires_at=?,status='active',"
                        "notified_exp=0,notified_traffic=0 WHERE tg_id=?",
                        (name, url, TRIAL_BYTES, exp, u["tg_id"]))
+            _h1_miss_cache.pop(u["tg_id"], None)
 
         if hwid not in devs:
             if len(devs) >= (u["device_limit"] or 1):
@@ -536,7 +712,9 @@ async def fulfill_payment(order_id: str):
         db.commit()
         try:
             u, t = ensure_user(p["tg_id"]), now()
-            if p["plan_key"] == "x":                       # доп. устройство: +1 слот
+            if p["plan_key"] == "test1":                   # тестовый платёж на 1 ₽ из админки — подписку не трогаем
+                pass
+            elif p["plan_key"] == "x":                     # доп. устройство: +1 слот
                 add_device_slot(p["tg_id"])
             elif u["status"] == "active" and u["expires_at"] > t:
                 await _extend_nolock(u, p["days"] * 24, PAID_GB if u["plan"] != "paid" else None)
