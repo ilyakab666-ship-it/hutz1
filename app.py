@@ -196,11 +196,10 @@ async def sub(token: str, request: Request):
         except Exception: used = 0
         hdrs["subscription-userinfo"] = (f"upload=0; download={used}; total={u['limit_bytes']}; "
                                          f"expire={u['expires_at']}")
-    default_title = f"{c.BRAND} (@hutzvpn_bot)" if "@hutzvpn_bot" not in c.BRAND else c.BRAND
-    hdrs["profile-title"] = os.getenv("HAPP_TITLE", default_title).strip()[:30]
+    hdrs["profile-title"] = os.getenv("HAPP_TITLE", c.BRAND).strip()[:25]
     hdrs["support-url"] = c.SUPPORT_URL           # иконка поддержки внутри Happ
     hdrs["profile-update-interval"] = "1"         # автообновление раз в час
-    ann = os.getenv("HAPP_ANNOUNCE", "💡 На моб. интернете выберите «NL · Мобильная связь». Помощь: нажмите сюда → поддержка").strip()
+    ann = os.getenv("HAPP_ANNOUNCE", "💡 На моб. интернете выберите «NL · Мобильная связь»").strip()
     if ann:
         hdrs["announce"] = "base64:" + base64.b64encode(ann.encode("utf-8")).decode()
         hdrs["announce-url"] = c.SUPPORT_URL

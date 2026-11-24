@@ -173,7 +173,7 @@ def connect_view(u) -> tuple[str, Kb]:
         [Btn(text="💻 ПК и другие версии", url=ALL_VERSIONS)],
         [Btn(text="🚀 Открыть в Happ", url=f"{c.PUBLIC_URL}/open/{u['token']}")],
         [Btn(text="📷 QR-код", callback_data="qr")],
-        [Btn(text="💳 Тарифы", callback_data="plans"), Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)],
+        [Btn(text="💳 Тарифы", callback_data="plans")],
         [BACK]])
     return text, kb
 
@@ -220,7 +220,7 @@ async def status_view(u) -> tuple[str, Kb]:
     kb_rows = [
         [Btn(text="🔄 Обновить", callback_data="status"), Btn(text="💳 Продлить", callback_data="plans")],
         *ch_btn,
-        [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL), BACK],
+        [BACK],
     ]
     return text, Kb(inline_keyboard=kb_rows)
 
@@ -302,7 +302,7 @@ def checkout_view(key: str, disc: int = 0) -> tuple[str, Kb] | None:
         [Btn(text="🏦 Оплатить через СБП", callback_data=f"pay:sbp:{key}")],
         [Btn(text="₿ Оплатить криптой", callback_data=f"pay:crypto:{key}")],
         [BTN_PROMO],
-        [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL), Btn(text="◀️ Назад", callback_data=back)]])
+        [Btn(text="◀️ Назад", callback_data=back)]])
 
 @router.callback_query(F.data == "plans")
 async def plans(q: CallbackQuery, state: FSMContext):
@@ -358,7 +358,7 @@ async def pay(q: CallbackQuery):
             "Если оплата не прошла или подписка не выдалась — нажмите «Проверить оплату» или напишите в поддержку.")
     await show(q, text, Kb(inline_keyboard=[[Btn(text="💳 Оплатить", url=d["pay_url"])],
                                             [Btn(text="🔄 Проверить оплату", callback_data=f"chk:{order_id}")],
-                                            [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL), back]]))
+                                            [back]]))
     await safe_answer(q)
 
 async def finalize_payment(order_id: str) -> str:
