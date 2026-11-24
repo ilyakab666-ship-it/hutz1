@@ -1,11 +1,11 @@
 """Telegram-бот: меню для пользователей (подключение, тарифы, промокоды) + админка по /admin."""
-import html, io, logging, time, traceback, uuid
+import asyncio, html, io, logging, time, traceback, uuid
 from urllib.parse import quote
 import qrcode
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,6 +33,8 @@ class PromoSt(StatesGroup):
 
 class AdmSt(StatesGroup):
     search = State()
+    broadcast = State()
+    bc_confirm = State()
 
 # ---------- хелперы ----------
 def fmt(b): return f"{b / c.GB:.2f} ГБ"
@@ -437,7 +439,7 @@ def list_view(page: int) -> tuple[str, Kb]:
     kb.append(nav)
     kb.append([Btn(text="🔍 Найти пользователя", callback_data="adm:find")])
     kb.append([Btn(text="🎟 Генератор промокодов", callback_data="adm:pg")])
-    kb.append([Btn(text="🧪 Тест (1 ₽)", callback_data="adm:testpay")])
+    kb.append([Btn(text="📣 Рассылка", callback_data="adm:bc"), Btn(text="🧪 Тест (1 ₽)", callback_data="adm:testpay")])
     kb.append([Btn(text="🔄 Синхр. H1", callback_data="adm:sync"), Btn(text="💾 Бэкап БД", callback_data="adm:backup")])
     active = sum(r["status"] == "active" for r in rows)
     return f"👥 <b>Пользователи</b>: {len(rows)}, активных: {active}", Kb(inline_keyboard=kb)
@@ -513,6 +515,62 @@ async def open_card(m: Message, query: str) -> bool:
 async def search_text(m: Message, state: FSMContext):
     if await open_card(m, m.text): await state.clear()
 
+_bc_running = False
+
+@router.message(AdmSt.broadcast, admin)
+async def bc_receive(m: Message, state: FSMContext):
+    if m.text and m.text.startswith("/"):
+        return
+    await state.update_data(bc_chat_id=m.chat.id, bc_msg_id=m.message_id)
+    await state.set_state(AdmSt.bc_confirm)
+    all_cnt = c.db.execute("SELECT COUNT(*) FROM users WHERE status!='banned'").fetchone()[0]
+    act_cnt = c.db.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0]
+    kb = Kb(inline_keyboard=[
+        [Btn(text=f"📢 Всем ({all_cnt})", callback_data="adm:bcgo:all")],
+        [Btn(text=f"🟢 Только активным ({act_cnt})", callback_data="adm:bcgo:active")],
+        [Btn(text="✖️ Отмена", callback_data="adm:l:0")]])
+    await m.answer("📣 <b>Подтверждение рассылки</b>\n\nСообщение выше готово к отправке. Кому разослать?",
+                   reply_markup=kb)
+
+async def _run_broadcast(admin_chat_id: int, status_msg_id: int, src_chat_id: int, src_msg_id: int, target: str):
+    global _bc_running
+    _bc_running = True
+    try:
+        sql = ("SELECT tg_id FROM users WHERE status='active'" if target == "active"
+               else "SELECT tg_id FROM users WHERE status!='banned'")
+        ids = [r[0] for r in c.db.execute(sql).fetchall()]
+        sent = blocked = failed = 0
+        for uid in ids:
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_msg_id)
+                sent += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 0.5)
+                try:
+                    await bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_msg_id)
+                    sent += 1
+                except TelegramForbiddenError:
+                    blocked += 1
+                except Exception:
+                    failed += 1
+            except TelegramForbiddenError:
+                blocked += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+        summary = (f"✅ <b>Рассылка завершена</b>\n\n"
+                   f"Всего получателей: <b>{len(ids)}</b>\n"
+                   f"Доставлено: <b>{sent}</b>\n"
+                   f"Заблокировали бота: <b>{blocked}</b>\n"
+                   f"Ошибок: <b>{failed}</b>")
+        kb = Kb(inline_keyboard=[[Btn(text="◀️ В админку", callback_data="adm:l:0")]])
+        try:
+            await bot.edit_message_text(summary, chat_id=admin_chat_id, message_id=status_msg_id, reply_markup=kb)
+        except Exception:
+            await bot.send_message(admin_chat_id, summary, reply_markup=kb)
+    finally:
+        _bc_running = False
+
 @router.callback_query(F.data.startswith("adm:"), admin)
 async def adm(q: CallbackQuery, state: FSMContext):
     p = q.data.split(":"); act = p[1]; note = None
@@ -522,6 +580,28 @@ async def adm(q: CallbackQuery, state: FSMContext):
         await show(q, "🔍 Отправьте числовой <b>TG ID</b> или <b>@username</b> пользователя.",
                    Kb(inline_keyboard=[[Btn(text="◀️ К списку", callback_data="adm:l:0")]]))
         return await safe_answer(q)
+    if act == "bc":
+        if _bc_running:
+            return await safe_answer(q, "⏳ Предыдущая рассылка ещё идёт, дождитесь завершения.", show_alert=True)
+        await state.set_state(AdmSt.broadcast)
+        await show(q, "📣 <b>Рассылка пользователям</b>\n\n"
+                      "Отправьте сообщение, которое нужно разослать (текст, фото с подписью или файл — форматирование сохранится).",
+                   Kb(inline_keyboard=[[Btn(text="✖️ Отмена", callback_data="adm:l:0")]]))
+        return await safe_answer(q)
+    if act == "bcgo":
+        if _bc_running:
+            return await safe_answer(q, "⏳ Рассылка уже запущена.", show_alert=True)
+        data = await state.get_data()
+        src_chat, src_msg = data.get("bc_chat_id"), data.get("bc_msg_id")
+        await state.clear()
+        if not (src_chat and src_msg):
+            return await safe_answer(q, "Сообщение для рассылки устарело, создайте заново.", show_alert=True)
+        target = p[2] if len(p) > 2 and p[2] in ("all", "active") else "all"
+        label_t = "активным пользователям" if target == "active" else "всем пользователям"
+        await show(q, f"⏳ <b>Рассылка запущена ({label_t})…</b>\nОтчёт появится здесь по завершении.",
+                   Kb(inline_keyboard=[[Btn(text="◀️ В админку", callback_data="adm:l:0")]]))
+        asyncio.create_task(_run_broadcast(q.message.chat.id, q.message.message_id, src_chat, src_msg, target))
+        return await safe_answer(q, "Рассылка запущена")
     await state.clear()
     if act == "l":
         text, kb = list_view(int(p[2])); await show(q, text, kb); return await safe_answer(q)
