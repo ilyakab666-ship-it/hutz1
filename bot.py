@@ -76,20 +76,25 @@ async def show(q: CallbackQuery, text: str, kb: Kb):
 
 # ---------- экраны пользователя ----------
 def welcome() -> str:
+    ch = f"\n📢 Наш канал — розыгрыши промокодов, новости и обновления: <a href=\"{c.CHANNEL_URL}\">@hutzvpn</a>" if c.CHANNEL_URL else ""
     return (f"<b>{c.BRAND}</b>\n{c.TAGLINE}\n\n"
             "🔒 Защищённое VPN-соединение: шифрование трафика, в том числе в публичных Wi-Fi сетях.\n"
             "⚡ Стабильный доступ к высокоскоростным серверам в Европе.\n\n"
             f"🎁 Бесплатный тест: <b>{c.TRIAL_HOURS} ч · {c.TRIAL_GB:g} ГБ</b>\n"
             "Нажмите «Подключить», чтобы начать.\n"
-            "Есть промокод? Нажмите «Активировать промокод».")
+            f"Есть промокод? Нажмите «Активировать промокод».{ch}")
 
 def kb_main() -> Kb:
-    return Kb(inline_keyboard=[
+    rows = [
         [Btn(text="🚀 Подключить", callback_data="connect")],
         [Btn(text="📊 Статус", callback_data="status"), Btn(text="💳 Тарифы", callback_data="plans")],
         [Btn(text="🎟 Активировать промокод", callback_data="promo")],
-        [Btn(text="📄 Политика", url=c.PRIVACY_URL), Btn(text="📜 Соглашение", url=c.TERMS_URL)],
-        [Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)]])
+    ]
+    if c.CHANNEL_URL:
+        rows.append([Btn(text="📢 Канал · Розыгрыши и новости", url=c.CHANNEL_URL)])
+    rows.append([Btn(text="📄 Политика", url=c.PRIVACY_URL), Btn(text="📜 Соглашение", url=c.TERMS_URL)])
+    rows.append([Btn(text="🆘 Поддержка", url=c.SUPPORT_URL)])
+    return Kb(inline_keyboard=rows)
 
 # нижняя постоянная клавиатура (только Меню и Подключить)
 RB_MENU, RB_CONNECT = "🏠 Меню", "🚀 Подключить"
@@ -127,9 +132,11 @@ def connect_view(u) -> tuple[str, Kb]:
             "1️⃣ Установите <b>Happ</b>\n"
             "2️⃣ Нажмите «🚀 Открыть в Happ» — подписка добавится сама\n"
             "3️⃣ Выберите сервер и включите VPN\n\n"
+            "💡 <b>На мобильном интернете</b> выберите локацию «<b>Нидерланды · Моб. сеть</b>» — она работает стабильнее. "
+            "Для домашнего Wi-Fi подходит «Автовыбор».\n\n"
             f"Ссылка для ручного добавления (тап — скопировать):\n<code>{c.sub_url(u)}</code>\n\n"
-            f"📱 Устройств в подписке: <b>{u['device_limit']}</b>. Не делитесь ссылкой — "
-            "новые устройства займут свободные слоты.")
+            f"⚠️ <b>Важно:</b> подписка рассчитана на <b>{u['device_limit']} устр.</b> — не передавайте ссылку другим людям, "
+            "иначе слоты устройств займутся и доступ заблокируется. Перед подключением выключите другие VPN.")
     kb = Kb(inline_keyboard=[
         [Btn(text="🍎 App Store", url=APP_STORE), Btn(text="🤖 Google Play", url=PLAY)],
         [Btn(text="💻 ПК и другие версии", url=ALL_VERSIONS)],
@@ -172,8 +179,13 @@ async def status_view(u) -> tuple[str, Kb]:
     text = (f"🟢 <b>Подписка активна</b> · {plan}\n\n"
             f"{bar(used, u['limit_bytes'])}\n{fmt(used)} / {fmt(u['limit_bytes'])}\n\n"
             f"⏳ Осталось: <b>{dur(u['expires_at'] - c.now())}</b>\n"
-            f"📱 Устройства: <b>{len(c.devices_of(u))}/{u['device_limit']}</b>{disc_line}")
-    return text, Kb(inline_keyboard=[[Btn(text="🔄 Обновить", callback_data="status")], [BACK]])
+            f"📱 Устройства: <b>{len(c.devices_of(u))}/{u['device_limit']}</b>{disc_line}\n\n"
+            "💡 <i>На мобильном интернете выберите локацию «Нидерланды · Моб. сеть» — она работает стабильнее.</i>")
+    kb_rows = [[Btn(text="🔄 Обновить", callback_data="status"), Btn(text="💳 Продлить", callback_data="plans")]]
+    if c.CHANNEL_URL:
+        kb_rows.append([Btn(text="📢 Наш канал · Промокоды и новости", url=c.CHANNEL_URL)])
+    kb_rows.append([BACK])
+    return text, Kb(inline_keyboard=kb_rows)
 
 @router.callback_query(F.data == "status")
 async def status(q: CallbackQuery):
@@ -218,7 +230,8 @@ def plans_view(disc: int = 0) -> tuple[str, Kb]:
     banner = f"🎁 <b>Ваша скидка -{disc}%</b> применится к оплате!\n\n" if disc > 0 else ""
     text = (f"💳 <b>Тарифы {c.BRAND}</b>\n<i>Шаг 1 из 3 — выберите пакет устройств</i>\n\n"
             f"{banner}В каждом тарифе: {includes()}\n\n" + "\n\n".join(blocks) + "\n\n"
-            f"➕ Доп. устройство (+1 слот): {_fmt_price(c.EXTRA_DEVICE_RUB, disc)}/мес за каждое.")
+            f"➕ Доп. устройство (+1 слот): {_fmt_price(c.EXTRA_DEVICE_RUB, disc)}/мес за каждое.\n\n"
+            "⚡ <i>Активация происходит автоматически сразу после оплаты. При продлении оставшиеся дни суммируются.</i>")
     kb = [[Btn(text=c.PACK_TITLE[d], callback_data=f"pk:{d}")] for d in c.PACKS]
     kb += [[BTN_PROMO], [BACK]]
     return text, Kb(inline_keyboard=kb)

@@ -1,6 +1,6 @@
 """FastAPI-прослойка для Happ + запуск бота и фоновых задач в одном процессе.
 Запуск: uvicorn app:app --env-file .env --host 127.0.0.1 --port 8000"""
-import asyncio, base64, html, json, logging, re
+import asyncio, base64, html, json, logging, os, re
 from urllib.parse import quote, unquote
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
@@ -92,7 +92,10 @@ app = FastAPI(lifespan=lifespan)
 
 
 def _clean_remark(name: str) -> str:
-    name = re.sub(r"билайн", "РФ", name, flags=re.I)
+    # "Нидерланды #1 · Билайн (через Москву)" -> "Нидерланды #1 · Моб. сеть" (ровно 25 символов, без запрещённых слов)
+    name = re.sub(r"билайн\s*\(через\s*москву\)", "Моб. сеть", name, flags=re.I)
+    name = re.sub(r"\(через\s*москву\)", "", name, flags=re.I)
+    name = re.sub(r"билайн", "Моб. сеть", name, flags=re.I)
     return re.sub(r"\s{2,}", " ", name).strip()
 
 def _is_redundant_auto(name: str) -> bool:
@@ -191,9 +194,14 @@ async def sub(token: str, request: Request):
         except Exception: used = 0
         hdrs["subscription-userinfo"] = (f"upload=0; download={used}; total={u['limit_bytes']}; "
                                          f"expire={u['expires_at']}")
-    hdrs["profile-title"] = c.BRAND[:25]          # название подписки в Happ (до 25 символов)
+    default_title = f"{c.BRAND} (@hutzvpn_bot)" if "@hutzvpn_bot" not in c.BRAND else c.BRAND
+    hdrs["profile-title"] = os.getenv("HAPP_TITLE", default_title).strip()[:30]
     hdrs["support-url"] = c.SUPPORT_URL           # иконка поддержки внутри Happ
     hdrs["profile-update-interval"] = "1"         # автообновление раз в час
+    ann = os.getenv("HAPP_ANNOUNCE", "💡 Для мобильного интернета выберите «Нидерланды · Моб. сеть»").strip()
+    if ann:
+        hdrs["announce"] = "base64:" + base64.b64encode(ann.encode("utf-8")).decode()
+        hdrs["announce-url"] = c.SUPPORT_URL
     hdrs.setdefault("content-type", "text/plain; charset=utf-8")
     return Response(body, headers=hdrs)
 
