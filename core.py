@@ -304,7 +304,7 @@ def _extract_clients(resp) -> list[dict]:
 
 def _upsert_from_h1_client(tg_id: int, cl: dict) -> str:
     """Создаёт или восстанавливает пользователя в локальной БД по данным клиента из H1Cloud.
-    Не затирает уже активных/забаненных пользователей; защищает от абуза триала после пересборки."""
+    Не затирает уже активных/забаненных пользователей и сохраняет привязанные устройства + лимит устройств."""
     name = cl.get("name") or f"tg{tg_id}"
     exp = _parse_ts(cl.get("expires_at") or cl.get("expire_at") or cl.get("expiry_time"))
     gb = float(cl.get("traffic_limit_gb") or 0)
@@ -318,18 +318,46 @@ def _upsert_from_h1_client(tg_id: int, cl: dict) -> str:
 
     u = get_user(tg_id)
     if not u:
+        restored_devs = [
+            r[0] for r in db.execute(
+                "SELECT hwid FROM device_info WHERE tg_id=? ORDER BY last_seen DESC", (tg_id,)
+            ).fetchall()
+        ]
+        if not restored_devs:
+            restored_devs = [
+                r[0] for r in db.execute(
+                    "SELECT hwid FROM hwids WHERE tg_id=? ORDER BY used_at DESC", (tg_id,)
+                ).fetchall()
+            ]
+        paid_rows = db.execute(
+            "SELECT devices FROM payments WHERE tg_id=? AND status='paid' AND plan_key!='test1'", (tg_id,)
+        ).fetchall()
+        extra_slots = db.execute(
+            "SELECT COUNT(*) FROM payments WHERE tg_id=? AND status='paid' AND plan_key='x'", (tg_id,)
+        ).fetchone()[0]
+        max_paid_devs = max([r[0] for r in paid_rows if r[0] and r[0] > 0] or [0])
+        restored_limit = max(DEFAULT_DEVICES, len(restored_devs), max_paid_devs + extra_slots)
         db.execute(
-            "INSERT INTO users(tg_id,token,key_id,access_url,plan,limit_bytes,expires_at,status,created_at,device_limit) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (tg_id, secrets.token_urlsafe(16), name, url, plan, limit_bytes, exp, status, t, DEFAULT_DEVICES))
+            "INSERT INTO users(tg_id,token,key_id,access_url,plan,limit_bytes,expires_at,status,created_at,device_limit,devices) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (tg_id, secrets.token_urlsafe(16), name, url, plan, limit_bytes, exp, status, t,
+             restored_limit, json.dumps(restored_devs[:restored_limit])))
         return "created"
     if u["status"] == "banned":
         return "skipped"
     if u["status"] == "new" or not u["key_id"] or (status == "active" and exp > (u["expires_at"] or 0)):
+        cur_devs = devices_of(u)
+        if not cur_devs:
+            cur_devs = [
+                r[0] for r in db.execute(
+                    "SELECT hwid FROM device_info WHERE tg_id=? ORDER BY last_seen DESC", (tg_id,)
+                ).fetchall()
+            ]
+        cur_limit = max(u["device_limit"] or DEFAULT_DEVICES, len(cur_devs))
         db.execute(
             "UPDATE users SET key_id=?, access_url=COALESCE(NULLIF(?,''),access_url), plan=?, "
-            "limit_bytes=?, expires_at=?, status=? WHERE tg_id=?",
-            (name, url, plan, limit_bytes, exp, status, tg_id))
+            "limit_bytes=?, expires_at=?, status=?, device_limit=?, devices=? WHERE tg_id=?",
+            (name, url, plan, limit_bytes, exp, status, cur_limit, json.dumps(cur_devs[:cur_limit]), tg_id))
         return "updated"
     return "skipped"
 
