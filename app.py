@@ -1,6 +1,7 @@
 """FastAPI-прослойка для Happ + запуск бота и фоновых задач в одном процессе.
 Запуск: uvicorn app:app --env-file .env --host 127.0.0.1 --port 8000"""
-import asyncio, base64, html, json, logging
+import asyncio, base64, html, json, logging, re
+from urllib.parse import quote, unquote
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
@@ -89,6 +90,78 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+def _clean_remark(name: str) -> str:
+    name = re.sub(r"билайн", "РФ", name, flags=re.I)
+    return re.sub(r"\s{2,}", " ", name).strip()
+
+def _is_redundant_auto(name: str) -> bool:
+    low = name.lower()
+    # Удаляем дубли вида "Нидерланды #1 · авто (Билайн)", не трогая общий профиль "Автовыбор"
+    return ("· авто" in low or "авто (" in low) and low != "автовыбор"
+
+def _clean_sub_body(body: bytes) -> bytes:
+    """Убирает дубли '· авто (...)' и заменяет упоминание оператора 'Билайн' на 'РФ' в JSON и vless:// подписках."""
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return body
+
+    stripped = text.strip()
+    # 1. JSON-подписка (массив или объект Xray-конфигов для Happ)
+    if stripped.startswith(("[", "{")):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, list):
+                out = []
+                for item in data:
+                    if isinstance(item, dict) and isinstance(item.get("remarks"), str):
+                        if _is_redundant_auto(item["remarks"]):
+                            continue
+                        item["remarks"] = _clean_remark(item["remarks"])
+                    out.append(item)
+                return json.dumps(out, ensure_ascii=False).encode("utf-8")
+            if isinstance(data, dict) and isinstance(data.get("remarks"), str):
+                data["remarks"] = _clean_remark(data["remarks"])
+                return json.dumps(data, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            logging.exception("clean_sub_body json failed")
+            return body
+
+    # 2. Список URI (обычный или base64)
+    is_b64 = "://" not in stripped
+    raw_lines_text = stripped
+    if is_b64:
+        try:
+            pad = "=" * (-len(stripped) % 4)
+            raw_lines_text = base64.b64decode(stripped + pad).decode("utf-8")
+        except Exception:
+            return body
+
+    out_lines = []
+    changed = False
+    for line in raw_lines_text.splitlines():
+        s = line.strip()
+        if not s or "#" not in s:
+            out_lines.append(line)
+            continue
+        base_uri, frag = s.split("#", 1)
+        remark = unquote(frag)
+        if _is_redundant_auto(remark):
+            changed = True
+            continue
+        new_remark = _clean_remark(remark)
+        if new_remark != remark:
+            changed = True
+        out_lines.append(f"{base_uri}#{quote(new_remark, safe='')}")
+
+    if not changed:
+        return body
+    res_text = "\n".join(out_lines)
+    if is_b64:
+        return base64.b64encode(res_text.encode("utf-8"))
+    return res_text.encode("utf-8")
+
 @app.get("/sub/{token}")
 async def sub(token: str, request: Request):
     hwid = (request.headers.get("x-hwid") or "").strip()
@@ -108,6 +181,7 @@ async def sub(token: str, request: Request):
         res = await c.fetch_sub_restoring(u, request.headers)
         if not res: return empty_sub()
         body, hdrs, u = res
+        body = _clean_sub_body(body)
     except Exception as e:
         logging.exception("sub failed")
         c.alert("sub", f"🔴 /sub не смог получить подписку с панели: {e!r}")
