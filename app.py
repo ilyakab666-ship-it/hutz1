@@ -4,7 +4,7 @@ import asyncio, base64, html, json, logging, os, re
 from urllib.parse import quote, unquote
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 import core as c
 import rollypay as rp
 from bot import bot, dp, dur, finalize_payment, notify_admins, send_db_backup, send_notice, setup_commands
@@ -252,7 +252,14 @@ async def open_in_happ(token: str):
     deeplink = f"happ://add/{sub_link}"
     page = (OPEN_PAGE.replace("__BRAND__", html.escape(c.BRAND)).replace("__DEEPLINK_JS__", json.dumps(deeplink))
             .replace("__DEEPLINK__", html.escape(deeplink)).replace("__SUB__", html.escape(sub_link)))
-    return HTMLResponse(page)
+return HTMLResponse(page)
+
+
+_INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+
+@app.get("/", include_in_schema=False)
+async def landing():
+    return FileResponse(_INDEX_HTML)
 
 
 if __name__ == "__main__":   # python app.py — то же, что uvicorn app:app (на Bothost запускается именно так)
