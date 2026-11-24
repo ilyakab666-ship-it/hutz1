@@ -252,7 +252,20 @@ async def open_in_happ(token: str):
     deeplink = f"happ://add/{sub_link}"
     page = (OPEN_PAGE.replace("__BRAND__", html.escape(c.BRAND)).replace("__DEEPLINK_JS__", json.dumps(deeplink))
             .replace("__DEEPLINK__", html.escape(deeplink)).replace("__SUB__", html.escape(sub_link)))
-return HTMLResponse(page)
+    return HTMLResponse(page)
+
+
+_INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+
+
+@app.get("/", include_in_schema=False)
+async def landing():
+    return FileResponse(_INDEX_HTML)
+
+
+if __name__ == "__main__":   # python app.py — то же, что uvicorn app:app (на Bothost запускается именно так)
+    import os, uvicorn
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")))
 
 
 _INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
