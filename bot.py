@@ -35,6 +35,11 @@ class AdmSt(StatesGroup):
     search = State()
     broadcast = State()
     bc_confirm = State()
+    pc_days = State()
+    pc_devices = State()
+    pc_discount = State()
+    pc_code = State()
+    pc_qty = State()
 
 # ---------- хелперы ----------
 def fmt(b): return f"{b / c.GB:.2f} ГБ"
@@ -163,10 +168,11 @@ async def status_view(u) -> tuple[str, Kb]:
     try: used = await c.usage(u["key_id"])
     except Exception: used = 0
     plan = "тест" if u["plan"] == "trial" else "оплачено"
+    disc_line = f"\n🎁 Скидка на след. оплату: <b>-{u['discount_pct']}%</b>" if (u["discount_pct"] or 0) > 0 else ""
     text = (f"🟢 <b>Подписка активна</b> · {plan}\n\n"
             f"{bar(used, u['limit_bytes'])}\n{fmt(used)} / {fmt(u['limit_bytes'])}\n\n"
             f"⏳ Осталось: <b>{dur(u['expires_at'] - c.now())}</b>\n"
-            f"📱 Устройства: <b>{len(c.devices_of(u))}/{u['device_limit']}</b>")
+            f"📱 Устройства: <b>{len(c.devices_of(u))}/{u['device_limit']}</b>{disc_line}")
     return text, Kb(inline_keyboard=[[Btn(text="🔄 Обновить", callback_data="status")], [BACK]])
 
 @router.callback_query(F.data == "status")
@@ -199,35 +205,45 @@ def support_link(msg: str) -> str:
     sep = "&" if "?" in c.SUPPORT_URL else "?"
     return f"{c.SUPPORT_URL}{sep}text={quote(msg, safe='')}"
 
-def plans_view() -> tuple[str, Kb]:
+def _fmt_price(base: int, disc: int) -> str:
+    if disc > 0:
+        return f"<s>{base} ₽</s> <b>{c.apply_discount(base, disc)} ₽</b>"
+    return f"<b>{base} ₽</b>"
+
+def plans_view(disc: int = 0) -> tuple[str, Kb]:
     blocks = []
     for d, ms in c.PACKS.items():
-        rows = "\n".join(f"  • {c.months_text(m)} ({m * c.MONTH_DAYS} дн.) — <b>{p} ₽</b>" for m, p in ms.items())
+        rows = "\n".join(f"  • {c.months_text(m)} ({m * c.MONTH_DAYS} дн.) — {_fmt_price(p, disc)}" for m, p in ms.items())
         blocks.append(f"<b>{c.PACK_TITLE[d]}</b>\n{rows}")
+    banner = f"🎁 <b>Ваша скидка -{disc}%</b> применится к оплате!\n\n" if disc > 0 else ""
     text = (f"💳 <b>Тарифы {c.BRAND}</b>\n<i>Шаг 1 из 3 — выберите пакет устройств</i>\n\n"
-            f"В каждом тарифе: {includes()}\n\n" + "\n\n".join(blocks) + "\n\n"
-            f"➕ Доп. устройство (+1 слот): <b>+{c.EXTRA_DEVICE_RUB} ₽/мес</b> за каждое.")
+            f"{banner}В каждом тарифе: {includes()}\n\n" + "\n\n".join(blocks) + "\n\n"
+            f"➕ Доп. устройство (+1 слот): {_fmt_price(c.EXTRA_DEVICE_RUB, disc)}/мес за каждое.")
     kb = [[Btn(text=c.PACK_TITLE[d], callback_data=f"pk:{d}")] for d in c.PACKS]
     kb += [[BTN_PROMO], [BACK]]
     return text, Kb(inline_keyboard=kb)
 
-def pack_view(d: int) -> tuple[str, Kb]:
+def pack_view(d: int, disc: int = 0) -> tuple[str, Kb]:
+    banner = f"🎁 Скидка <b>-{disc}%</b> уже учтена в ценах!\n\n" if disc > 0 else ""
+    extra_p = c.apply_discount(c.EXTRA_DEVICE_RUB, disc)
     text = (f"<b>{c.PACK_TITLE[d]}</b>\n<i>Шаг 2 из 3 — срок подписки</i>\n\n"
-            f"📱 Устройств: <b>{d}</b> · 🌍 {c.LOCATION} · ⚡ {c.traffic_text()}\n\n"
-            f"Нужны ещё устройства? Добавьте слот на {c.EXTRA_DEVICE_DAYS} дней за {c.EXTRA_DEVICE_RUB} ₽.")
-    kb = [[Btn(text=f"🗓 {c.months_text(m)} — {p} ₽", callback_data=f"buy:d{d}m{m}")] for m, p in c.PACKS[d].items()]
-    kb.append([Btn(text=f"➕ Добавить +1 устройство ({c.EXTRA_DEVICE_DAYS} дн) — {c.EXTRA_DEVICE_RUB} ₽", callback_data="buy:x")])
+            f"{banner}📱 Устройств: <b>{d}</b> · 🌍 {c.LOCATION} · ⚡ {c.traffic_text()}\n\n"
+            f"Нужны ещё устройства? Добавьте слот на {c.EXTRA_DEVICE_DAYS} дней за {extra_p} ₽.")
+    kb = [[Btn(text=f"🗓 {c.months_text(m)} — {c.apply_discount(p, disc)} ₽" + (f" (-{disc}%)" if disc > 0 else ""),
+               callback_data=f"buy:d{d}m{m}")] for m, p in c.PACKS[d].items()]
+    kb.append([Btn(text=f"➕ Добавить +1 устройство ({c.EXTRA_DEVICE_DAYS} дн) — {extra_p} ₽", callback_data="buy:x")])
     kb.append([Btn(text="◀️ Назад", callback_data="plans")])
     return text, Kb(inline_keyboard=kb)
 
-def checkout_view(key: str) -> tuple[str, Kb] | None:
+def checkout_view(key: str, disc: int = 0) -> tuple[str, Kb] | None:
     it = item_of(key)
     if not it: return None
-    title, price, days = it
+    title, base_price, days = it
+    price_line = f"{_fmt_price(base_price, disc)} (скидка -{disc}%)" if disc > 0 else f"<b>{base_price} ₽</b>"
     text = (f"🧾 <b>Оформление</b>\n<i>Шаг 3 из 3 — способ оплаты</i>\n\n"
             f"Тариф: <b>{title}</b>\nСрок: <b>{days} дн.</b>\n"
             + ("" if key == "x" else f"Устройств: <b>{c.PLANS[key]['devices']}</b> · Локация: {c.LOCATION} · {c.traffic_text()}\n")
-            + f"К оплате: <b>{price} ₽</b>")
+            + f"К оплате: {price_line}")
     if key == "x": text += "\n\n<i>Слот добавляется к вашей активной подписке после оплаты.</i>"
     back = "plans" if key == "x" else f"pk:{c.PLANS[key]['devices']}"
     return text, Kb(inline_keyboard=[
@@ -239,17 +255,20 @@ def checkout_view(key: str) -> tuple[str, Kb] | None:
 @router.callback_query(F.data == "plans")
 async def plans(q: CallbackQuery, state: FSMContext):
     await state.clear()
-    text, kb = plans_view(); await show(q, text, kb); await safe_answer(q)
+    u = c.ensure_user(q.from_user.id, q.from_user.username)
+    text, kb = plans_view(u["discount_pct"] or 0); await show(q, text, kb); await safe_answer(q)
 
 @router.callback_query(F.data.regexp(r"^pk:\d+$"))
 async def pack(q: CallbackQuery):
     d = int(q.data.split(":")[1])
     if d not in c.PACKS: return await safe_answer(q, "Тариф не найден", show_alert=True)
-    text, kb = pack_view(d); await show(q, text, kb); await safe_answer(q)
+    u = c.ensure_user(q.from_user.id, q.from_user.username)
+    text, kb = pack_view(d, u["discount_pct"] or 0); await show(q, text, kb); await safe_answer(q)
 
 @router.callback_query(F.data.startswith("buy:"))
 async def buy(q: CallbackQuery):
-    v = checkout_view(q.data.split(":")[1])
+    u = c.ensure_user(q.from_user.id, q.from_user.username)
+    v = checkout_view(q.data.split(":")[1], u["discount_pct"] or 0)
     if not v: return await safe_answer(q, "Тариф не найден", show_alert=True)
     await show(q, *v); await safe_answer(q)
 
@@ -259,7 +278,7 @@ async def pay(q: CallbackQuery):
     it = item_of(key)
     if not it or how not in rp.METHODS:
         return await safe_answer(q, "Тариф не найден", show_alert=True)
-    title, price, days = it
+    title, base_price, days = it
     back = Btn(text="◀️ Назад", callback_data=f"buy:{key}")
     fallback = ([[Btn(text="🛒 Купить код", url=c.SHOP_URL)]] if c.SHOP_URL else []) + \
                [[Btn(text="🎟 Ввести промокод", callback_data="promo")], [back]]
@@ -268,6 +287,8 @@ async def pay(q: CallbackQuery):
         return await safe_answer(q)
     u = c.ensure_user(q.from_user.id, q.from_user.username)
     if u["status"] == "banned": return await safe_answer(q, "Доступ заблокирован", show_alert=True)
+    disc = u["discount_pct"] or 0
+    price = c.apply_discount(base_price, disc)
     devices = 1 if key == "x" else c.PLANS[key]["devices"]
     order_id = uuid.uuid4().hex
     c.create_payment_row(order_id, q.from_user.id, key, days, devices, price, how)
@@ -361,6 +382,16 @@ async def do_redeem(m: Message, raw: str) -> bool:
     if st == "used_self":
         await m.answer("✅ Этот код уже активирован на вашем аккаунте.", reply_markup=Kb(inline_keyboard=[
             [Btn(text="📊 Статус", callback_data="status")], [BACK]]))
+        return True
+    if st == "ok_discount":
+        await m.answer(f"🎁 <b>Промокод на скидку -{p['discount_pct']}% активирован!</b>\n\n"
+                       "Скидка автоматически применится к вашей следующей оплате в разделе «Тарифы».",
+                       reply_markup=Kb(inline_keyboard=[[Btn(text="💳 Перейти к тарифам", callback_data="plans")], [BACK]]))
+        return True
+    if st == "discount_better":
+        await m.answer(f"ℹ️ У вас уже активна скидка <b>-{u['discount_pct']}%</b> — она не меньше скидки по этому коду. "
+                       "Код не потрачен.",
+                       reply_markup=Kb(inline_keyboard=[[Btn(text="💳 Перейти к тарифам", callback_data="plans")], [BACK]]))
         return True
     if st == "ok":
         await m.answer(f"✅ <b>Промокод активирован!</b>\n\n➕ Добавлено: <b>{p['days']} дн.</b>\n"
@@ -484,11 +515,32 @@ async def card_view(tg_id: int) -> tuple[str, Kb]:
     return text, Kb(inline_keyboard=rows + [to_list])
 
 def promo_menu_view() -> tuple[str, Kb]:
-    kb = [[Btn(text=f"{c.PACK_TITLE[p['devices']].split()[0]} {p['devices']} устр. · {c.months_text(p['months'])} — {p['price']} ₽",
-               callback_data=f"adm:pt:{p['key']}")] for p in c.PLANS.values()]
+    kb = [
+        [Btn(text="⚙️ Свой промокод (дни / скидка)", callback_data="adm:pc")],
+        [Btn(text="📋 Активные промокоды", callback_data="adm:pl")],
+    ]
+    kb += [[Btn(text=f"{c.PACK_TITLE[p['devices']].split()[0]} {p['devices']} устр. · {c.months_text(p['months'])} — {p['price']} ₽",
+                callback_data=f"adm:pt:{p['key']}")] for p in c.PLANS.values()]
     kb.append([Btn(text="◀️ К списку", callback_data="adm:l:0")])
-    return (f"🎟 <b>Генератор промокодов</b>\n\nВыберите тариф. Свободных кодов в базе: <b>{c.promos_left()}</b>",
+    return (f"🎟 <b>Генератор промокодов</b>\n\nВыберите быстрый тариф или создайте свой промокод с любыми параметрами.\n"
+            f"Активных кодов в базе: <b>{c.promos_left()}</b>",
             Kb(inline_keyboard=kb))
+
+def active_promos_view() -> tuple[str, Kb]:
+    rows = c.list_active_promos(15)
+    if not rows:
+        return ("📋 <b>Активные промокоды</b>\n\nСейчас нет свободных промокодов.",
+                Kb(inline_keyboard=[[Btn(text="⚙️ Создать промокод", callback_data="adm:pc")],
+                                    [Btn(text="◀️ Назад", callback_data="adm:pg")]]))
+    lines, kb = [], []
+    for r in rows:
+        kind = r["kind"] or "days"
+        desc = f"-{r['discount_pct']}%" if kind == "discount" else f"{r['days']} дн. · {r['devices']} устр."
+        uses = f"{r['uses_count'] or 0}/{r['max_uses'] or 1}"
+        lines.append(f"• <code>{r['code']}</code> — {desc} ({uses})")
+        kb.append([Btn(text=f"🗑 {r['code']} ({desc}, {uses})", callback_data=f"adm:pd:{r['code']}")])
+    kb.append([Btn(text="◀️ Назад", callback_data="adm:pg")])
+    return "📋 <b>Активные промокоды (последние 15)</b>\n<i>Нажмите на код, чтобы удалить его:</i>\n\n" + "\n".join(lines), Kb(inline_keyboard=kb)
 
 @router.message(Command("admin", "users"), admin)
 async def admin_cmd(m: Message, state: FSMContext):
@@ -571,6 +623,124 @@ async def _run_broadcast(admin_chat_id: int, status_msg_id: int, src_chat_id: in
     finally:
         _bc_running = False
 
+# ---------- конструктор кастомных промокодов ----------
+async def _pc_ask_devices(msg: Message, state: FSMContext, days: int):
+    await state.update_data(pc_days=days)
+    await state.set_state(AdmSt.pc_devices)
+    kb = Kb(inline_keyboard=[
+        [Btn(text="1", callback_data="adm:pcdv:1"), Btn(text="2", callback_data="adm:pcdv:2"),
+         Btn(text="3", callback_data="adm:pcdv:3"), Btn(text="5", callback_data="adm:pcdv:5")],
+        [Btn(text="✖️ Отмена", callback_data="adm:pg")]])
+    await msg.answer(f"📅 Дней: <b>{days}</b>\n\n<b>Шаг 2:</b> Сколько устройств дать по этому промокоду? "
+                     "Нажмите кнопку или введите своё число (1–20):", reply_markup=kb)
+
+async def _pc_ask_code(msg: Message, state: FSMContext):
+    await state.set_state(AdmSt.pc_code)
+    d = await state.get_data()
+    info = (f"💸 Скидка: <b>-{d['pc_discount']}%</b>" if d.get("pc_kind") == "discount"
+            else f"📅 Подписка: <b>{d['pc_days']} дн. · {d['pc_devices']} устр.</b>")
+    kb = Kb(inline_keyboard=[
+        [Btn(text="🎲 Сгенерировать случайно", callback_data="adm:pcrnd")],
+        [Btn(text="✖️ Отмена", callback_data="adm:pg")]])
+    await msg.answer(f"{info}\n\n<b>Название промокода:</b> отправьте свой текст (например <code>SALE20</code> или <code>HUTZ7</code>) "
+                     "или нажмите «Сгенерировать случайно»:", reply_markup=kb)
+
+async def _pc_ask_qty(msg: Message, state: FSMContext, custom_code: str | None):
+    await state.update_data(pc_code=custom_code)
+    await state.set_state(AdmSt.pc_qty)
+    if custom_code:
+        kb = Kb(inline_keyboard=[
+            [Btn(text="1 (одноразовый)", callback_data="adm:pcq:1"), Btn(text="10", callback_data="adm:pcq:10")],
+            [Btn(text="50", callback_data="adm:pcq:50"), Btn(text="100", callback_data="adm:pcq:100"),
+             Btn(text="1000", callback_data="adm:pcq:1000")],
+            [Btn(text="✖️ Отмена", callback_data="adm:pg")]])
+        await msg.answer(f"🏷 Код: <code>{custom_code}</code>\n\n"
+                         "<b>Лимит активаций:</b> сколько человек смогут применить этот код? "
+                         "Нажмите кнопку или введите любое число:", reply_markup=kb)
+    else:
+        kb = Kb(inline_keyboard=[
+            [Btn(text="1", callback_data="adm:pcq:1"), Btn(text="5", callback_data="adm:pcq:5"),
+             Btn(text="10", callback_data="adm:pcq:10"), Btn(text="25", callback_data="adm:pcq:25")],
+            [Btn(text="✖️ Отмена", callback_data="adm:pg")]])
+        await msg.answer("🎲 <b>Случайные одноразовые коды</b>\n\n"
+                         "Сколько уникальных кодов создать? Нажмите кнопку или введите число (1–100):", reply_markup=kb)
+
+async def _pc_finish(target_msg: Message, state: FSMContext, qty: int, edit: bool = False):
+    d = await state.get_data()
+    await state.clear()
+    kind = d.get("pc_kind", "days")
+    custom_code = d.get("pc_code")
+    days = d.get("pc_days", 0)
+    devices = d.get("pc_devices", 1)
+    disc = d.get("pc_discount", 0)
+    max_uses = qty if custom_code else 1
+    count = 1 if custom_code else qty
+    try:
+        codes = c.create_custom_promos(kind=kind, days=days, devices=devices, discount_pct=disc,
+                                       max_uses=max_uses, count=count, custom_code=custom_code)
+    except ValueError as e:
+        kb = Kb(inline_keyboard=[[Btn(text="⚙️ Попробовать снова", callback_data="adm:pc")],
+                                 [Btn(text="◀️ К промокодам", callback_data="adm:pg")]])
+        text = f"❌ {html.escape(str(e))}"
+        if edit: await target_msg.edit_text(text, reply_markup=kb)
+        else: await target_msg.answer(text, reply_markup=kb)
+        return
+    desc = f"Скидка -{disc}%" if kind == "discount" else f"{days} дн. · {devices} устр."
+    extra = f"Лимит активаций: <b>{max_uses}</b>" if custom_code else f"Создано одноразовых кодов: <b>{len(codes)}</b>"
+    text = (f"✅ <b>Промокод создан!</b>\n{desc} · {extra}\n"
+            f"<i>Тапните по блоку, чтобы скопировать:</i>\n\n"
+            f"<pre>{chr(10).join(codes)}</pre>")
+    kb = Kb(inline_keyboard=[
+        [Btn(text="⚙️ Создать ещё", callback_data="adm:pc")],
+        [Btn(text="📋 Активные коды", callback_data="adm:pl")],
+        [Btn(text="◀️ В админку", callback_data="adm:l:0")]])
+    if edit:
+        try: await target_msg.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest: await target_msg.answer(text, reply_markup=kb)
+    else:
+        await target_msg.answer(text, reply_markup=kb)
+
+@router.message(AdmSt.pc_days, admin, F.text, ~F.text.startswith("/"))
+async def pc_days_text(m: Message, state: FSMContext):
+    try: days = int(m.text.strip())
+    except ValueError: return await m.answer("❌ Введите целое число дней (например <code>7</code> или <code>45</code>).")
+    if not (1 <= days <= 3650): return await m.answer("❌ Укажите число дней от 1 до 3650.")
+    await _pc_ask_devices(m, state, days)
+
+@router.message(AdmSt.pc_devices, admin, F.text, ~F.text.startswith("/"))
+async def pc_devices_text(m: Message, state: FSMContext):
+    try: devs = int(m.text.strip())
+    except ValueError: return await m.answer("❌ Введите целое число устройств (например <code>1</code> или <code>3</code>).")
+    if not (1 <= devs <= 20): return await m.answer("❌ Укажите от 1 до 20 устройств.")
+    await state.update_data(pc_devices=devs)
+    await _pc_ask_code(m, state)
+
+@router.message(AdmSt.pc_discount, admin, F.text, ~F.text.startswith("/"))
+async def pc_discount_text(m: Message, state: FSMContext):
+    raw = m.text.strip().rstrip("%").strip()
+    try: pct = int(raw)
+    except ValueError: return await m.answer("❌ Введите размер скидки в процентах (например <code>20</code>).")
+    if not (1 <= pct <= 95): return await m.answer("❌ Скидка должна быть от 1 до 95%.")
+    await state.update_data(pc_discount=pct)
+    await _pc_ask_code(m, state)
+
+@router.message(AdmSt.pc_code, admin, F.text, ~F.text.startswith("/"))
+async def pc_code_text(m: Message, state: FSMContext):
+    code = c.norm_code(m.text)
+    if len(code) < 3 or len(code) > 32:
+        return await m.answer("❌ Код должен содержать от 3 до 32 латинских букв/цифр (например <code>SALE20</code>).")
+    await _pc_ask_qty(m, state, code)
+
+@router.message(AdmSt.pc_qty, admin, F.text, ~F.text.startswith("/"))
+async def pc_qty_text(m: Message, state: FSMContext):
+    try: qty = int(m.text.strip())
+    except ValueError: return await m.answer("❌ Введите целое число.")
+    d = await state.get_data()
+    max_allowed = 100000 if d.get("pc_code") else 100
+    if not (1 <= qty <= max_allowed):
+        return await m.answer(f"❌ Укажите число от 1 до {max_allowed}.")
+    await _pc_finish(m, state, qty, edit=False)
+
 @router.callback_query(F.data.startswith("adm:"), admin)
 async def adm(q: CallbackQuery, state: FSMContext):
     p = q.data.split(":"); act = p[1]; note = None
@@ -602,7 +772,56 @@ async def adm(q: CallbackQuery, state: FSMContext):
                    Kb(inline_keyboard=[[Btn(text="◀️ В админку", callback_data="adm:l:0")]]))
         asyncio.create_task(_run_broadcast(q.message.chat.id, q.message.message_id, src_chat, src_msg, target))
         return await safe_answer(q, "Рассылка запущена")
+    if act == "pc":
+        await state.clear()
+        kb = Kb(inline_keyboard=[
+            [Btn(text="📅 На дни (подписка)", callback_data="adm:pck:days")],
+            [Btn(text="💸 Скидка на оплату (%)", callback_data="adm:pck:discount")],
+            [Btn(text="◀️ Назад", callback_data="adm:pg")]])
+        await show(q, "⚙️ <b>Создание своего промокода</b>\n\nВыберите тип промокода:", kb)
+        return await safe_answer(q)
+    if act == "pck":
+        kind = p[2]
+        await state.update_data(pc_kind=kind)
+        if kind == "discount":
+            await state.set_state(AdmSt.pc_discount)
+            kb = Kb(inline_keyboard=[
+                [Btn(text="10%", callback_data="adm:pcds:10"), Btn(text="20%", callback_data="adm:pcds:20"),
+                 Btn(text="30%", callback_data="adm:pcds:30"), Btn(text="50%", callback_data="adm:pcds:50")],
+                [Btn(text="✖️ Отмена", callback_data="adm:pg")]])
+            await show(q, "💸 <b>Промокод на скидку</b>\n\nВыберите размер скидки или введите число от 1 до 95:", kb)
+        else:
+            await state.set_state(AdmSt.pc_days)
+            kb = Kb(inline_keyboard=[
+                [Btn(text="3 дн", callback_data="adm:pcd:3"), Btn(text="7 дн", callback_data="adm:pcd:7"),
+                 Btn(text="14 дн", callback_data="adm:pcd:14"), Btn(text="30 дн", callback_data="adm:pcd:30")],
+                [Btn(text="✖️ Отмена", callback_data="adm:pg")]])
+            await show(q, "📅 <b>Промокод на дни</b>\n\n<b>Шаг 1:</b> Сколько дней подписки? Нажмите кнопку или введите своё число:", kb)
+        return await safe_answer(q)
+    if act == "pcd":
+        await _pc_ask_devices(q.message, state, int(p[2]))
+        return await safe_answer(q)
+    if act == "pcdv":
+        await state.update_data(pc_devices=int(p[2]))
+        await _pc_ask_code(q.message, state)
+        return await safe_answer(q)
+    if act == "pcds":
+        await state.update_data(pc_discount=int(p[2]))
+        await _pc_ask_code(q.message, state)
+        return await safe_answer(q)
+    if act == "pcrnd":
+        await _pc_ask_qty(q.message, state, None)
+        return await safe_answer(q)
+    if act == "pcq":
+        await _pc_finish(q.message, state, int(p[2]), edit=True)
+        return await safe_answer(q, "Готово")
     await state.clear()
+    if act == "pl":
+        text, kb = active_promos_view(); await show(q, text, kb); return await safe_answer(q)
+    if act == "pd":
+        code = p[2]
+        c.delete_promo(code)
+        text, kb = active_promos_view(); await show(q, text, kb); return await safe_answer(q, f"Удалён: {code}")
     if act == "l":
         text, kb = list_view(int(p[2])); await show(q, text, kb); return await safe_answer(q)
     if act == "sync":

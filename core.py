@@ -91,7 +91,12 @@ def _init_db():
       hwid TEXT PRIMARY KEY, tg_id INTEGER, model TEXT, os TEXT, first_seen INTEGER, last_seen INTEGER);
     CREATE TABLE IF NOT EXISTS promo_codes(
       code TEXT PRIMARY KEY, days INTEGER NOT NULL, devices INTEGER NOT NULL,
-      is_used INTEGER DEFAULT 0, used_by INTEGER, created_at INTEGER, used_at INTEGER);
+      is_used INTEGER DEFAULT 0, used_by INTEGER, created_at INTEGER, used_at INTEGER,
+      kind TEXT DEFAULT 'days', discount_pct INTEGER DEFAULT 0,
+      max_uses INTEGER DEFAULT 1, uses_count INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS promo_uses(
+      code TEXT NOT NULL, tg_id INTEGER NOT NULL, used_at INTEGER,
+      PRIMARY KEY (code, tg_id));
     CREATE TABLE IF NOT EXISTS payments(
       order_id TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, plan_key TEXT NOT NULL,
       days INTEGER NOT NULL, devices INTEGER NOT NULL, amount INTEGER NOT NULL, method TEXT,
@@ -99,9 +104,17 @@ def _init_db():
       rp_payment_id TEXT, pay_url TEXT, created_at INTEGER, paid_at INTEGER);
     """)
     for _ddl in ("username TEXT", "devices TEXT DEFAULT '[]'", "device_limit INTEGER DEFAULT 1",
-                 "notified_exp INTEGER DEFAULT 0", "notified_traffic INTEGER DEFAULT 0"):
+                 "notified_exp INTEGER DEFAULT 0", "notified_traffic INTEGER DEFAULT 0",
+                 "discount_pct INTEGER DEFAULT 0", "discount_code TEXT"):
         try: db.execute(f"ALTER TABLE users ADD COLUMN {_ddl}")   # автомиграция старых БД
         except sqlite3.OperationalError: pass
+    for _ddl in ("kind TEXT DEFAULT 'days'", "discount_pct INTEGER DEFAULT 0",
+                 "max_uses INTEGER DEFAULT 1", "uses_count INTEGER DEFAULT 0"):
+        try: db.execute(f"ALTER TABLE promo_codes ADD COLUMN {_ddl}")
+        except sqlite3.OperationalError: pass
+    db.execute("UPDATE promo_codes SET uses_count=1 WHERE is_used=1 AND (uses_count IS NULL OR uses_count=0)")
+    db.execute("UPDATE promo_codes SET max_uses=1 WHERE max_uses IS NULL OR max_uses<1")
+    db.execute("UPDATE promo_codes SET kind='days' WHERE kind IS NULL OR kind=''")
     for _r in db.execute("SELECT tg_id,hwid,devices FROM users WHERE hwid IS NOT NULL AND hwid!=''").fetchall():
         try: _devs = json.loads(_r["devices"] or "[]")
         except ValueError: _devs = []
@@ -628,46 +641,108 @@ def _new_code() -> str:
     g = lambda: "".join(secrets.choice(_PROMO_ALPHABET) for _ in range(4))
     return f"HUTZ-{g()}-{g()}"
 
-def gen_promos(days: int, devices: int, n: int) -> list[str]:
-    """Создаёт n уникальных кодов на days дней и devices устройств."""
+def apply_discount(price: int, discount_pct: int) -> int:
+    """Возвращает цену со скидкой (не ниже 1 ₽)."""
+    pct = max(0, min(99, int(discount_pct or 0)))
+    return max(1, round(price * (100 - pct) / 100)) if pct else price
+
+def create_custom_promos(kind: str = "days", days: int = 0, devices: int = 1, discount_pct: int = 0,
+                         max_uses: int = 1, count: int = 1, custom_code: str | None = None) -> list[str]:
+    """Создаёт 1 кастомный промокод (если задан custom_code) или count случайных кодов.
+    kind: 'days' (подписка на days дней и devices устройств) | 'discount' (скидка discount_pct% на оплату)."""
+    kind = "discount" if kind == "discount" else "days"
+    days = max(0, int(days))
+    devices = max(1, int(devices))
+    discount_pct = max(0, min(95, int(discount_pct)))
+    max_uses = max(1, int(max_uses))
+    count = max(1, min(100, int(count)))
+    t = now()
+
+    if custom_code:
+        code = norm_code(custom_code)
+        if len(code) < 3 or len(code) > 32:
+            raise ValueError("Код должен содержать от 3 до 32 латинских букв/цифр.")
+        try:
+            db.execute(
+                "INSERT INTO promo_codes(code,days,devices,is_used,created_at,kind,discount_pct,max_uses,uses_count) "
+                "VALUES(?,?,?,0,?,?,?,?,0)",
+                (code, days, devices, t, kind, discount_pct, max_uses))
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Промокод {code} уже существует.")
+        db.commit()
+        return [code]
+
     codes = []
-    while len(codes) < n:
+    while len(codes) < count:
         code = _new_code()
         try:
-            db.execute("INSERT INTO promo_codes(code,days,devices,is_used,created_at) VALUES(?,?,?,0,?)",
-                       (code, days, devices, now()))
+            db.execute(
+                "INSERT INTO promo_codes(code,days,devices,is_used,created_at,kind,discount_pct,max_uses,uses_count) "
+                "VALUES(?,?,?,0,?,?,?,?,0)",
+                (code, days, devices, t, kind, discount_pct, max_uses))
         except sqlite3.IntegrityError:
             continue
         codes.append(code)
     db.commit()
     return codes
 
+def gen_promos(days: int, devices: int, n: int) -> list[str]:
+    """Создаёт n уникальных одноразовых кодов на days дней и devices устройств."""
+    return create_custom_promos(kind="days", days=days, devices=devices, max_uses=1, count=n)
+
 def promos_left() -> int:
-    return db.execute("SELECT COUNT(*) FROM promo_codes WHERE is_used=0").fetchone()[0]
+    return db.execute("SELECT COUNT(*) FROM promo_codes WHERE is_used=0 AND uses_count < max_uses").fetchone()[0]
+
+def list_active_promos(limit: int = 20):
+    return db.execute(
+        "SELECT * FROM promo_codes WHERE is_used=0 AND uses_count < max_uses "
+        "ORDER BY (max_uses > 1) DESC, created_at DESC LIMIT ?", (limit,)).fetchall()
+
+def delete_promo(code: str) -> bool:
+    cur = db.execute("DELETE FROM promo_codes WHERE code=?", (code,))
+    db.execute("DELETE FROM promo_uses WHERE code=?", (code,))
+    db.commit()
+    return bool(cur.rowcount)
 
 async def redeem_promo(tg_id: int, raw: str):
     """Активация кода. Возвращает (статус, user, promo):
-    ok | invalid | used | used_self (уже активирован этим же пользователем) | banned | throttled.
-    Активный пользователь — подписка продлевается на days (устройства: не меньше, чем в коде, докупленные слоты не теряются).
-    Новый / истёкший — доступ выдаётся заново на days, лимит устройств = devices из кода.
-    Если панель недоступна — код возвращается в оборот, а исключение уходит наверх."""
+    ok | ok_discount | discount_better | invalid | used | used_self | banned | throttled."""
     code, t = norm_code(raw), now()
     async with _lock:
         _promo_gc(t)
         fails = [x for x in _promo_fails.get(tg_id, []) if x > t - PROMO_WINDOW]
         if len(fails) >= PROMO_MAX_FAILS: return "throttled", None, None
         p = db.execute("SELECT * FROM promo_codes WHERE code=?", (code,)).fetchone()
-        if not p or p["is_used"]:
-            if p and p["used_by"] == tg_id: return "used_self", None, p   # двойное нажатие / повторная отправка
+        if not p:
             _promo_fails[tg_id] = fails + [t]
-            return ("used" if p else "invalid"), None, None
+            return "invalid", None, None
+        already = db.execute("SELECT 1 FROM promo_uses WHERE code=? AND tg_id=?", (code, tg_id)).fetchone()
+        if already or (p["max_uses"] <= 1 and p["used_by"] == tg_id):
+            return "used_self", None, p
+        if p["is_used"] or (p["uses_count"] or 0) >= (p["max_uses"] or 1):
+            _promo_fails[tg_id] = fails + [t]
+            return "used", None, None
         u = ensure_user(tg_id)
         if u["status"] == "banned": return "banned", u, p
-        # «занимаем» код до обращения к панели — два одновременных ввода не пройдут оба
-        if not db.execute("UPDATE promo_codes SET is_used=1,used_by=?,used_at=? WHERE code=? AND is_used=0",
-                          (tg_id, t, code)).rowcount:
+        kind = p["kind"] or "days"
+        if kind == "discount" and (u["discount_pct"] or 0) >= (p["discount_pct"] or 0):
+            return "discount_better", u, p
+        # «занимаем» активацию до обращения к панели
+        cur = db.execute(
+            "UPDATE promo_codes SET uses_count=uses_count+1, "
+            "is_used=CASE WHEN uses_count+1 >= max_uses THEN 1 ELSE 0 END, "
+            "used_by=?, used_at=? WHERE code=? AND is_used=0 AND uses_count < max_uses",
+            (tg_id, t, code))
+        if not cur.rowcount:
             return "used", None, None
+        db.execute("INSERT OR IGNORE INTO promo_uses(code,tg_id,used_at) VALUES(?,?,?)", (code, tg_id, t))
         db.commit()
+        if kind == "discount":
+            db.execute("UPDATE users SET discount_pct=?, discount_code=? WHERE tg_id=?",
+                       (p["discount_pct"], code, tg_id))
+            db.commit()
+            _promo_fails.pop(tg_id, None)
+            return "ok_discount", get_user(tg_id), p
         try:
             if u["status"] == "active" and u["expires_at"] > t:
                 await _extend_nolock(u, p["days"] * 24, PAID_GB if u["plan"] != "paid" else None)
@@ -677,7 +752,9 @@ async def redeem_promo(tg_id: int, raw: str):
             else:
                 await _grant_nolock(u, p["days"], PAID_GB, p["devices"])
         except Exception:
-            db.execute("UPDATE promo_codes SET is_used=0,used_by=NULL,used_at=NULL WHERE code=?", (code,))
+            db.execute(
+                "UPDATE promo_codes SET uses_count=MAX(0,uses_count-1), is_used=0 WHERE code=?", (code,))
+            db.execute("DELETE FROM promo_uses WHERE code=? AND tg_id=?", (code, tg_id))
             db.commit()
             raise
         _promo_fails.pop(tg_id, None)
@@ -723,6 +800,9 @@ async def fulfill_payment(order_id: str):
                 db.commit()
             else:
                 await _grant_nolock(u, p["days"], PAID_GB, p["devices"])
+            if p["plan_key"] != "test1" and (u["discount_pct"] or 0) > 0:
+                db.execute("UPDATE users SET discount_pct=0, discount_code=NULL WHERE tg_id=?", (p["tg_id"],))
+                db.commit()
         except Exception:
             db.execute("UPDATE payments SET status='pending', paid_at=NULL WHERE order_id=?", (order_id,))
             db.commit()
