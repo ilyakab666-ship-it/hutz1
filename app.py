@@ -5,7 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import core as c
-from bot import bot, dp, dur, notify_admins, send_notice, setup_commands
+import rollypay as rp
+from bot import bot, dp, dur, finalize_payment, notify_admins, send_notice, setup_commands
 
 logging.basicConfig(level=logging.INFO)
 
@@ -107,6 +108,33 @@ async def sub(token: str, request: Request):
     hdrs["profile-update-interval"] = "1"         # автообновление раз в час
     hdrs.setdefault("content-type", "text/plain; charset=utf-8")
     return Response(body, headers=hdrs)
+
+@app.post("/webhook/rollypay")
+async def webhook_rollypay(request: Request):
+    raw = await request.body()                       # подпись считается по сырому телу
+    if not rp.verify_signature(raw, request.headers.get("x-signature", ""), request.headers.get("x-timestamp", "")):
+        logging.warning("rollypay webhook: неверная подпись")
+        return PlainTextResponse("bad signature", status_code=403)
+    try: d = json.loads(raw)
+    except ValueError: return PlainTextResponse("bad json", status_code=400)
+    if d.get("event_type") != "payment.paid" or d.get("status") != "paid":
+        return PlainTextResponse("ok")               # прочие события (created/expired/underpaid…) — просто 2xx
+    if d.get("test") and not rp.TEST_MODE:
+        return PlainTextResponse("ok")               # тестовый платёж в боевом режиме не зачисляем
+    p = c.get_payment_row(str(d.get("order_id", "")))
+    if not p:
+        logging.warning("rollypay webhook: неизвестный order_id %s", d.get("order_id"))
+        return PlainTextResponse("ok")
+    try: paid = float(d.get("amount", 0))
+    except (TypeError, ValueError): paid = 0
+    if paid + 0.001 < p["amount"]:                   # сумма в вебхуке меньше счёта — не зачисляем
+        await notify_admins(f"⚠️ RollyPay: сумма {d.get('amount')} ≠ {p['amount']} по заказу {p['order_id']}")
+        return PlainTextResponse("ok")
+    try: await finalize_payment(p["order_id"])
+    except Exception:
+        logging.exception("webhook finalize")
+        return PlainTextResponse("retry", status_code=500)   # RollyPay повторит доставку (панель недоступна)
+    return PlainTextResponse("ok")
 
 OPEN_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>__BRAND__</title>

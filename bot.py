@@ -1,5 +1,5 @@
 """Telegram-бот: меню для пользователей (подключение, тарифы, промокоды) + админка по /admin."""
-import html, io, logging, time, traceback
+import html, io, logging, time, traceback, uuid
 from urllib.parse import quote
 import qrcode
 from aiogram import Bot, Dispatcher, F, Router
@@ -13,6 +13,7 @@ from aiogram.types import (BotCommand, BotCommandScopeChat, BotCommandScopeDefau
                            CallbackQuery, ErrorEvent, InlineKeyboardButton as Btn,
                            InlineKeyboardMarkup as Kb, KeyboardButton as RBtn, Message, ReplyKeyboardMarkup)
 import core as c
+import rollypay as rp
 
 bot = Bot(c.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
 dp = Dispatcher()
@@ -228,7 +229,8 @@ def checkout_view(key: str) -> tuple[str, Kb] | None:
     if key == "x": text += "\n\n<i>Слот добавляется к вашей активной подписке после оплаты.</i>"
     back = "plans" if key == "x" else f"pk:{c.PLANS[key]['devices']}"
     return text, Kb(inline_keyboard=[
-        [Btn(text="💳 Оплатить картой / СБП", callback_data=f"pay:card:{key}")],
+        [Btn(text="🏦 Оплатить через СБП", callback_data=f"pay:sbp:{key}")],
+        [Btn(text="₿ Оплатить криптой", callback_data=f"pay:crypto:{key}")],
         [BTN_PROMO],
         [Btn(text="◀️ Назад", callback_data=back)]])
 
@@ -253,22 +255,66 @@ async def buy(q: CallbackQuery):
 async def pay(q: CallbackQuery):
     _, how, key = q.data.split(":")
     it = item_of(key)
-    if not it:
+    if not it or how not in rp.METHODS:
         return await safe_answer(q, "Тариф не найден", show_alert=True)
     title, price, days = it
     back = Btn(text="◀️ Назад", callback_data=f"buy:{key}")
-    text = (
-        "💳 <b>Оплата картой / СБП</b>\n\n"
-        "Автооплата через RollyPay скоро заработает. Сейчас можно купить код через площадку "
-        "и активировать его в боте."
-    )
-    rows = ([[Btn(text="🛒 Купить код", url=c.SHOP_URL)]] if c.SHOP_URL else []) + [
-        [Btn(text="🎟 Ввести промокод", callback_data="promo")],
-        [back],
-    ]
-    await show(q, text, Kb(inline_keyboard=rows))
+    fallback = ([[Btn(text="🛒 Купить код", url=c.SHOP_URL)]] if c.SHOP_URL else []) + \
+               [[Btn(text="🎟 Ввести промокод", callback_data="promo")], [back]]
+    if not rp.ENABLED:
+        await show(q, "💳 Автооплата временно недоступна. Можно активировать промокод.", Kb(inline_keyboard=fallback))
+        return await safe_answer(q)
+    u = c.ensure_user(q.from_user.id, q.from_user.username)
+    if u["status"] == "banned": return await safe_answer(q, "Доступ заблокирован", show_alert=True)
+    devices = 1 if key == "x" else c.PLANS[key]["devices"]
+    order_id = uuid.uuid4().hex
+    c.create_payment_row(order_id, q.from_user.id, key, days, devices, price, how)
+    try:
+        d = await rp.create_payment(order_id, price, how, f"{c.BRAND}: {title}", q.from_user.id)
+    except Exception as e:
+        logging.exception("rollypay create")
+        c.mark_payment_failed(order_id)
+        c.alert("rp_create", f"🔴 RollyPay: не удалось создать счёт: {e!r}")
+        await show(q, "⚠️ Не удалось создать счёт, попробуйте через минуту.", Kb(inline_keyboard=fallback))
+        return await safe_answer(q)
+    c.set_payment_link(order_id, d["payment_id"], d["pay_url"])
+    text = (f"🧾 <b>Счёт создан</b>\n\nТариф: <b>{title}</b>\nСрок: <b>{days} дн.</b>\nК оплате: <b>{price} ₽</b>\n\n"
+            "Нажмите «Оплатить», после оплаты подписка активируется автоматически. "
+            "Если сообщения нет — нажмите «Проверить оплату».")
+    await show(q, text, Kb(inline_keyboard=[[Btn(text="💳 Оплатить", url=d["pay_url"])],
+                                            [Btn(text="🔄 Проверить оплату", callback_data=f"chk:{order_id}")], [back]]))
     await safe_answer(q)
-    
+
+async def finalize_payment(order_id: str) -> str:
+    """Зачисляет оплаченный заказ (идемпотентно) и пишет пользователю. Возвращает ok | already | unknown."""
+    st, p = await c.fulfill_payment(order_id)
+    if st == "ok":
+        kb = Kb(inline_keyboard=[[Btn(text="🔑 Получить ссылку", callback_data="connect")]])
+        text = (f"✅ Оплата прошла, подписка активирована на <b>{p['days']} дней</b>." if p["plan_key"] != "x"
+                else "✅ Оплата прошла, добавлен +1 слот устройства.")
+        try: await bot.send_message(p["tg_id"], text, reply_markup=kb)
+        except Exception: logging.warning("не удалось уведомить %s об оплате %s", p["tg_id"], order_id)
+        await notify_admins(f"💰 Оплата {p['amount']} ₽ · {p['plan_key']} · tg {p['tg_id']} · {p['method']}")
+    return st
+
+@router.callback_query(F.data.startswith("chk:"))
+async def check_pay(q: CallbackQuery):
+    p = c.get_payment_row(q.data.split(":", 1)[1])
+    if not p or p["tg_id"] != q.from_user.id: return await safe_answer(q, "Платёж не найден", show_alert=True)
+    if p["status"] == "paid": return await safe_answer(q, "✅ Оплата уже получена, подписка активна", show_alert=True)
+    try: info = await rp.get_payment(p["rp_payment_id"])
+    except Exception:
+        logging.exception("rollypay status")
+        return await safe_answer(q, "Не удалось проверить, попробуйте позже", show_alert=True)
+    if info.get("status") == "paid" and str(info.get("amount")) and float(info["amount"]) == float(p["amount"]):
+        try: await finalize_payment(p["order_id"])
+        except Exception:
+            logging.exception("finalize")
+            return await safe_answer(q, "Оплата получена, но выдача задерживается — повторите через минуту", show_alert=True)
+        return await safe_answer(q)
+    msg = {"expired": "Срок счёта истёк, создайте новый", "canceled": "Платёж отменён"}.get(
+        info.get("status"), "Оплата пока не поступила. Если уже оплатили — подождите минуту")
+    await safe_answer(q, msg, show_alert=True)
 
 # ---------- нижняя клавиатура (хендлеры стоят выше промокодов: кнопка работает и в режиме ввода кода) ----------
 @router.message(F.text == RB_MENU)

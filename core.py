@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS device_info(      -- модель/ОС устройс
 CREATE TABLE IF NOT EXISTS promo_codes(
   code TEXT PRIMARY KEY, days INTEGER NOT NULL, devices INTEGER NOT NULL,
   is_used INTEGER DEFAULT 0, used_by INTEGER, created_at INTEGER, used_at INTEGER);
+CREATE TABLE IF NOT EXISTS payments(
+  order_id TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, plan_key TEXT NOT NULL,
+  days INTEGER NOT NULL, devices INTEGER NOT NULL, amount INTEGER NOT NULL, method TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',      -- pending | paid | failed
+  rp_payment_id TEXT, pay_url TEXT, created_at INTEGER, paid_at INTEGER);
 """)
 for _ddl in ("username TEXT", "devices TEXT DEFAULT '[]'", "device_limit INTEGER DEFAULT 1",
              "notified_exp INTEGER DEFAULT 0", "notified_traffic INTEGER DEFAULT 0"):
@@ -501,6 +506,50 @@ async def redeem_promo(tg_id: int, raw: str):
             raise
         _promo_fails.pop(tg_id, None)
         return "ok", get_user(tg_id), p
+
+# ---------- платежи (RollyPay) ----------
+def create_payment_row(order_id: str, tg_id: int, key: str, days: int, devices: int, amount: int, method: str):
+    db.execute("INSERT INTO payments(order_id,tg_id,plan_key,days,devices,amount,method,status,created_at) "
+               "VALUES(?,?,?,?,?,?,?,'pending',?)", (order_id, tg_id, key, days, devices, amount, method, now()))
+    db.commit()
+
+def get_payment_row(order_id: str): return db.execute("SELECT * FROM payments WHERE order_id=?", (order_id,)).fetchone()
+
+def set_payment_link(order_id: str, rp_id: str, url: str):
+    db.execute("UPDATE payments SET rp_payment_id=?, pay_url=? WHERE order_id=?", (rp_id, url, order_id)); db.commit()
+
+def mark_payment_failed(order_id: str):
+    db.execute("UPDATE payments SET status='failed' WHERE order_id=? AND status='pending'", (order_id,)); db.commit()
+
+async def fulfill_payment(order_id: str):
+    """Идемпотентное зачисление. Возвращает ('ok', row) — зачислено сейчас; ('already', row) — уже было;
+    ('unknown', None) — заказа нет. Заказ «занимается» атомарным UPDATE до обращения к панели
+    (повторный вебхук/кнопка не начислят второй раз); при сбое панели статус откатывается и исключение
+    уходит наверх (вебхук ответит 500 -> RollyPay повторит доставку)."""
+    async with _lock:
+        p = get_payment_row(order_id)
+        if not p: return "unknown", None
+        if p["status"] == "paid": return "already", p
+        if not db.execute("UPDATE payments SET status='paid', paid_at=? WHERE order_id=? AND status!='paid'",
+                          (now(), order_id)).rowcount:
+            return "already", p
+        db.commit()
+        try:
+            u, t = ensure_user(p["tg_id"]), now()
+            if p["plan_key"] == "x":                       # доп. устройство: +1 слот
+                add_device_slot(p["tg_id"])
+            elif u["status"] == "active" and u["expires_at"] > t:
+                await _extend_nolock(u, p["days"] * 24, PAID_GB if u["plan"] != "paid" else None)
+                db.execute("UPDATE users SET plan='paid', device_limit=? WHERE tg_id=?",
+                           (max(u["device_limit"] or 1, p["devices"]), p["tg_id"]))
+                db.commit()
+            else:
+                await _grant_nolock(u, p["days"], PAID_GB, p["devices"])
+        except Exception:
+            db.execute("UPDATE payments SET status='pending', paid_at=NULL WHERE order_id=?", (order_id,))
+            db.commit()
+            raise
+        return "ok", get_payment_row(order_id)
 
 # ---------- уведомления (флаги в БД → нет спама после перезапуска) ----------
 def notify_expiring() -> list[tuple[int, int]]:
