@@ -91,35 +91,35 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-_PROTO_NOISE = {"vless", "vmess", "trojan", "shadowsocks", "ss", "hysteria2", "outbounds", "inbounds",
-                "freedom", "blackhole", "dns", "direct", "block", "selector", "urltest"}
+_TRANSPORTS = {"grpc", "tcp", "xhttp", "splithttp", "ws", "websocket", "httpupgrade", "kcp", "h2", "quic"}
 
-def _extract_proto_from_item(item, depth: int = 0) -> str:
-    """Ищет транспорт (network/grpc/xhttp/tcp…) рекурсивно, включая списки outbounds[]."""
-    if depth > 6:
+def _collect_protos(obj, out: set, depth: int = 0) -> None:
+    """Собирает все транспорты (network/net/type/grpcSettings) по всему узлу, включая списки outbounds[]."""
+    if depth > 8:
+        return
+    if isinstance(obj, list):
+        for el in obj:
+            _collect_protos(el, out, depth + 1)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if kl in ("network", "net", "transport", "type") and isinstance(v, str) and v.strip().lower() in _TRANSPORTS:
+                out.add(v.strip().lower())
+            elif kl in ("grpcsettings", "grpc_settings"):
+                out.add("grpc")
+            if isinstance(v, (dict, list)):
+                _collect_protos(v, out, depth + 1)
+
+def _extract_proto_from_item(item) -> str:
+    """'grpc', если ВСЕ найденные транспорты узла/группы gRPC; иначе первый найденный (или '')."""
+    found: set = set()
+    _collect_protos(item, found)
+    if not found:
         return ""
-    if isinstance(item, list):
-        for el in item:
-            p = _extract_proto_from_item(el, depth + 1)
-            if p:
-                return p
-        return ""
-    if not isinstance(item, dict):
-        return ""
-    for k in ("network", "net", "transport", "type"):
-        v = item.get(k)
-        if isinstance(v, str) and v.strip() and v.strip().lower() not in _PROTO_NOISE:
-            return v.strip().lower()
-        if isinstance(v, dict) and isinstance(v.get("type"), str):
-            return v["type"].strip().lower()
-    if "grpcSettings" in item or "grpc_settings" in item:
+    if found == {"grpc"}:
         return "grpc"
-    for sub in item.values():
-        if isinstance(sub, (dict, list)):
-            p = _extract_proto_from_item(sub, depth + 1)
-            if p:
-                return p
-    return ""
+    found.discard("grpc")
+    return sorted(found)[0] if found else "grpc"
 
 def _extract_proto_from_uri(base_uri: str, remark: str = "") -> str:
     m = re.search(r"(?:[?&])(?:type|transport|net)=([^&#]+)", base_uri, flags=re.I)
@@ -173,8 +173,11 @@ def _clean_remark(name: str, proto: str = "") -> str:
         else:
             s = f"{s} Мобильная связь"
     else:
-        if is_grpc and s.lower() != "автовыбор":
-            s = f"{s} Wi-Fi"
+        if is_grpc:
+            if "автовыбор" in s.lower():
+                s = f"Wi-Fi {s}"
+            else:
+                s = f"{s} Wi-Fi"
 
     s = re.sub(r"\(\s*\)", "", s)
     s = re.sub(r"\s{2,}", " ", s).strip(" -")
