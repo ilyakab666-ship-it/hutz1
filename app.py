@@ -201,6 +201,13 @@ def _transform_json_node(item: dict) -> dict | None:
     if _is_redundant_auto(orig_name):
         return None
     p = _extract_proto_from_item(item)
+    if "автовыбор" in orig_name.lower():
+        # диагностика: структура узла без секретов (длинные строки заменены на "…")
+        def _skel(o, d=0):
+            if isinstance(o, dict): return {k: _skel(v, d + 1) for k, v in o.items()} if d < 7 else "{…}"
+            if isinstance(o, list): return [_skel(v, d + 1) for v in o[:6]]
+            return "…" if isinstance(o, str) and len(o) > 24 else o
+        logging.info("AUTO node proto=%r skeleton=%s", p, json.dumps(_skel(item), ensure_ascii=False)[:3000])
     new_item = dict(item)
     new_item[name_key] = _clean_remark(orig_name, p)
     return new_item
