@@ -91,12 +91,35 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def _clean_remark(name: str) -> str:
+def _extract_proto_from_item(item) -> str:
+    if not isinstance(item, dict):
+        return ""
+    for k in ("network", "net", "protocol", "transport", "type"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    stream = item.get("streamSettings") or item.get("stream_settings")
+    if isinstance(stream, dict):
+        for k in ("network", "net", "security"):
+            v = stream.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip().lower()
+    return ""
+
+def _clean_remark(name: str, proto: str = "") -> str:
     s = name.strip()
-    is_mobile = bool(re.search(r"мобильн\w*\s*связ\w*|билайн|через\s*москву|\bmob\b", s, flags=re.I))
+    if not s:
+        return s
+
+    p_low = (proto or "").lower()
+    is_grpc = ("grpc" in p_low) or bool(re.search(r"\bgrpc\b", s, flags=re.I))
+    is_mobile = bool(re.search(r"мобильн\w*\s*связ\w*|wifi\s*\+\s*моб\w*\s*связ\w*|билайн|через\s*москву|\bmob\b", s, flags=re.I))
+
+    # Убираем любые существующие приписки Wi-Fi / (Wi-Fi) / вайфай
+    s = re.sub(r"\s*[·|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
 
     if is_mobile:
-        # Укорачиваем название страны до 2 букв, чтобы на экране телефона не обрезалось "Мобильная связь"
+        # Укорачиваем название страны до 2 букв, чтобы не обрезалось на телефоне
         s = re.sub(r"\bнидерланды\b", "NL", s, flags=re.I)
         s = re.sub(r"\bфинляндия\b", "FI", s, flags=re.I)
         s = re.sub(r"\bгермания\b", "DE", s, flags=re.I)
@@ -104,20 +127,24 @@ def _clean_remark(name: str) -> str:
         s = re.sub(r"\bэстония\b", "EE", s, flags=re.I)
         s = re.sub(r"\bпольша\b", "PL", s, flags=re.I)
         s = re.sub(r"\bсша\b", "US", s, flags=re.I)
-        # Убираем приписку (Wi-Fi) / Wi-Fi из мобильных нод
-        s = re.sub(r"\s*[·|/-]?\s*\(?\s*wi-?fi\s*\)?", "", s, flags=re.I)
         s = re.sub(r"билайн\s*\(через\s*москву\)", "Мобильная связь", s, flags=re.I)
         s = re.sub(r"\(через\s*москву\)", "", s, flags=re.I)
         s = re.sub(r"билайн", "Мобильная связь", s, flags=re.I)
-        s = re.sub(r"\bмобильная\s+связь\b", "Мобильная связь", s, flags=re.I)
-        if "мобильная связь" not in s.lower():
-            s = f"{s} · Мобильная связь"
+        s = re.sub(r"(?:wifi\s*\+\s*)?мобильная\s+связь", "Wi-Fi + Мобильная связь" if is_grpc else "Мобильная связь", s, flags=re.I)
+        if is_grpc:
+            if "wi-fi + мобильная связь" not in s.lower():
+                if "мобильная связь" in s.lower():
+                    s = re.sub(r"мобильная\s+связь", "Wi-Fi + Мобильная связь", s, flags=re.I)
+                else:
+                    s = f"{s} · Wi-Fi + Мобильная связь"
+        else:
+            if "мобильная связь" not in s.lower():
+                s = f"{s} · Мобильная связь"
     else:
-        # Обычные ноды для Wi-Fi: если нет пометки Wi-Fi и это не "Автовыбор", добавляем "· Wi-Fi"
-        if s.lower() != "автовыбор" and not re.search(r"wi-?fi|вайфай", s, flags=re.I):
-            s = f"{s} · Wi-Fi"
+        if is_grpc and s.lower() != "автовыбор":
+            if not re.search(r"\bwi-?fi\b", s, flags=re.I):
+                s = f"{s} · Wi-Fi"
 
-    # Чистим лишние разделители и пробелы
     s = re.sub(r"\s*[·|]\s*[·|]\s*", " · ", s)
     s = re.sub(r"\(\s*\)", "", s)
     s = re.sub(r"\s{2,}", " ", s).strip(" ·-")
@@ -146,7 +173,7 @@ def _clean_sub_body(body: bytes) -> bytes:
                     if isinstance(item, dict) and isinstance(item.get("remarks"), str):
                         if _is_redundant_auto(item["remarks"]):
                             continue
-                        item["remarks"] = _clean_remark(item["remarks"])
+                        item["remarks"] = _clean_remark(item["remarks"], _extract_proto_from_item(item))
                     out.append(item)
                 return json.dumps(out, ensure_ascii=False).encode("utf-8")
             if isinstance(data, dict) and isinstance(data.get("remarks"), str):
