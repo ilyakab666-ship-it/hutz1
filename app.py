@@ -98,12 +98,23 @@ def _extract_proto_from_item(item) -> str:
         v = item.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip().lower()
-    stream = item.get("streamSettings") or item.get("stream_settings")
-    if isinstance(stream, dict):
-        for k in ("network", "net", "security"):
-            v = stream.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip().lower()
+    for container_key in ("streamSettings", "stream_settings", "outbound", "xray", "config"):
+        sub = item.get(container_key)
+        if isinstance(sub, dict):
+            for k in ("network", "net", "type", "transport"):
+                v = sub.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip().lower()
+    return ""
+
+def _extract_proto_from_uri(base_uri: str, remark: str = "") -> str:
+    # Ищем тип транспорта в query-параметрах URI (type=grpc, transport=grpc, net=grpc) и в самом названии
+    m = re.search(r"(?:[?&])(?:type|transport|net)=([^&#]+)", base_uri, flags=re.I)
+    if m:
+        return unquote(m.group(1)).strip().lower()
+    m2 = re.search(r"\b(grpc|xhttp|tcp|ws|httpupgrade|kcp)\b", remark or "", flags=re.I)
+    if m2:
+        return m2.group(1).strip().lower()
     return ""
 
 def _clean_remark(name: str, proto: str = "") -> str:
@@ -113,13 +124,19 @@ def _clean_remark(name: str, proto: str = "") -> str:
 
     p_low = (proto or "").lower()
     is_grpc = ("grpc" in p_low) or bool(re.search(r"\bgrpc\b", s, flags=re.I))
-    is_mobile = bool(re.search(r"мобильн\w*\s*связ\w*|wifi\s*\+\s*моб\w*\s*связ\w*|билайн|через\s*москву|\bmob\b", s, flags=re.I))
+    is_mobile = bool(re.search(
+        r"мобильн\w*\s*связ\w*|wi-?fi\s*\+\s*моб\w*\s*связ\w*|билайн|через\s*москву|\bmob\b",
+        s,
+        flags=re.I,
+    ))
 
-    # Убираем любые существующие приписки Wi-Fi / (Wi-Fi) / вайфай
+    # Снимаем любые существующие приписки Wi-Fi / вайфай (включая "Wi-Fi + Мобильная связь")
+    s = re.sub(r"\s*[·|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\+\s*", " · ", s, flags=re.I)
+    s = re.sub(r"\s*\+\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
     s = re.sub(r"\s*[·|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
 
     if is_mobile:
-        # Укорачиваем название страны до 2 букв, чтобы не обрезалось на телефоне
+        # Сокращаем название страны до 2 букв, чтобы помещалось на экране телефона
         s = re.sub(r"\bнидерланды\b", "NL", s, flags=re.I)
         s = re.sub(r"\bфинляндия\b", "FI", s, flags=re.I)
         s = re.sub(r"\bгермания\b", "DE", s, flags=re.I)
@@ -130,20 +147,19 @@ def _clean_remark(name: str, proto: str = "") -> str:
         s = re.sub(r"билайн\s*\(через\s*москву\)", "Мобильная связь", s, flags=re.I)
         s = re.sub(r"\(через\s*москву\)", "", s, flags=re.I)
         s = re.sub(r"билайн", "Мобильная связь", s, flags=re.I)
-        s = re.sub(r"(?:wifi\s*\+\s*)?мобильная\s+связь", "Wi-Fi + Мобильная связь" if is_grpc else "Мобильная связь", s, flags=re.I)
+
+        if "мобильная связь" not in s.lower():
+            s = f"{s} · Мобильная связь"
+
+        # Для мобильных нод на gRPC делаем метку "Wi-Fi + Мобильная связь"
         if is_grpc:
-            if "wi-fi + мобильная связь" not in s.lower():
-                if "мобильная связь" in s.lower():
-                    s = re.sub(r"мобильная\s+связь", "Wi-Fi + Мобильная связь", s, flags=re.I)
-                else:
-                    s = f"{s} · Wi-Fi + Мобильная связь"
+            s = re.sub(r"мобильная\s+связь", "Wi-Fi + Мобильная связь", s, flags=re.I)
         else:
-            if "мобильная связь" not in s.lower():
-                s = f"{s} · Мобильная связь"
+            s = re.sub(r"мобильная\s+связь", "Мобильная связь", s, flags=re.I)
     else:
+        # Обычная нода (не мобильная): метку Wi-Fi ставим только для gRPC
         if is_grpc and s.lower() != "автовыбор":
-            if not re.search(r"\bwi-?fi\b", s, flags=re.I):
-                s = f"{s} · Wi-Fi"
+            s = f"{s} · Wi-Fi"
 
     s = re.sub(r"\s*[·|]\s*[·|]\s*", " · ", s)
     s = re.sub(r"\(\s*\)", "", s)
@@ -205,7 +221,7 @@ def _clean_sub_body(body: bytes) -> bytes:
         if _is_redundant_auto(remark):
             changed = True
             continue
-        new_remark = _clean_remark(remark)
+        new_remark = _clean_remark(remark, _extract_proto_from_uri(base_uri, remark))
         if new_remark != remark:
             changed = True
         out_lines.append(f"{base_uri}#{quote(new_remark, safe='')}")
