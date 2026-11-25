@@ -94,21 +94,22 @@ app = FastAPI(lifespan=lifespan)
 def _extract_proto_from_item(item) -> str:
     if not isinstance(item, dict):
         return ""
-    for k in ("network", "net", "protocol", "transport", "type"):
+    for k in ("network", "net", "transport", "type"):
         v = item.get(k)
-        if isinstance(v, str) and v.strip():
+        if isinstance(v, str) and v.strip() and v.strip().lower() not in ("vless", "vmess", "trojan", "shadowsocks", "ss", "hysteria2", "outbounds", "inbounds"):
             return v.strip().lower()
-    for container_key in ("streamSettings", "stream_settings", "outbound", "xray", "config"):
+    for container_key in (
+        "streamSettings", "stream_settings", "outbound", "xray",
+        "config", "settings", "transportSettings", "transport_settings", "transport"
+    ):
         sub = item.get(container_key)
         if isinstance(sub, dict):
-            for k in ("network", "net", "type", "transport"):
-                v = sub.get(k)
-                if isinstance(v, str) and v.strip():
-                    return v.strip().lower()
+            p = _extract_proto_from_item(sub)
+            if p:
+                return p
     return ""
 
 def _extract_proto_from_uri(base_uri: str, remark: str = "") -> str:
-    # Ищем тип транспорта в query-параметрах URI (type=grpc, transport=grpc, net=grpc) и в самом названии
     m = re.search(r"(?:[?&])(?:type|transport|net)=([^&#]+)", base_uri, flags=re.I)
     if m:
         return unquote(m.group(1)).strip().lower()
@@ -130,13 +131,15 @@ def _clean_remark(name: str, proto: str = "") -> str:
         flags=re.I,
     ))
 
-    # Снимаем любые существующие приписки Wi-Fi / вайфай (включая "Wi-Fi + Мобильная связь")
-    s = re.sub(r"\s*[·|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\+\s*", " · ", s, flags=re.I)
+    # Убираем точки "·" внутри названия, чтобы не было лишних точек между страной/номером/меткой
+    s = re.sub(r"\s*·\s*", " ", s)
+
+    # Снимаем любые существующие приписки Wi-Fi / вайфай
+    s = re.sub(r"\s*[|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\+\s*", " ", s, flags=re.I)
     s = re.sub(r"\s*\+\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
-    s = re.sub(r"\s*[·|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
+    s = re.sub(r"\s*[|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
 
     if is_mobile:
-        # Сокращаем название страны до 2 букв, чтобы помещалось на экране телефона
         s = re.sub(r"\bнидерланды\b", "NL", s, flags=re.I)
         s = re.sub(r"\bфинляндия\b", "FI", s, flags=re.I)
         s = re.sub(r"\bгермания\b", "DE", s, flags=re.I)
@@ -148,22 +151,18 @@ def _clean_remark(name: str, proto: str = "") -> str:
         s = re.sub(r"\(через\s*москву\)", "", s, flags=re.I)
         s = re.sub(r"билайн", "Мобильная связь", s, flags=re.I)
 
-        if "мобильная связь" not in s.lower():
-            s = f"{s} · Мобильная связь"
-
-        # Для мобильных нод на gRPC делаем метку "Wi-Fi + Мобильная связь"
+        s = re.sub(r"\s*мобильная\s+связь\s*", " ", s, flags=re.I)
+        s = re.sub(r"\s{2,}", " ", s).strip()
         if is_grpc:
-            s = re.sub(r"мобильная\s+связь", "Wi-Fi + Мобильная связь", s, flags=re.I)
+            s = f"{s} Wi-Fi + Мобильная связь"
         else:
-            s = re.sub(r"мобильная\s+связь", "Мобильная связь", s, flags=re.I)
+            s = f"{s} Мобильная связь"
     else:
-        # Обычная нода (не мобильная): метку Wi-Fi ставим только для gRPC
         if is_grpc and s.lower() != "автовыбор":
-            s = f"{s} · Wi-Fi"
+            s = f"{s} Wi-Fi"
 
-    s = re.sub(r"\s*[·|]\s*[·|]\s*", " · ", s)
     s = re.sub(r"\(\s*\)", "", s)
-    s = re.sub(r"\s{2,}", " ", s).strip(" ·-")
+    s = re.sub(r"\s{2,}", " ", s).strip(" -")
     return s
 
 def _is_redundant_auto(name: str) -> bool:
@@ -171,30 +170,60 @@ def _is_redundant_auto(name: str) -> bool:
     # Удаляем дубли вида "Нидерланды #1 · авто (Билайн)", не трогая общий профиль "Автовыбор"
     return ("· авто" in low or "авто (" in low) and low != "автовыбор"
 
+def _transform_json_node(item: dict) -> dict | None:
+    # Поддерживаем и "remarks", и "tag" (если подписка отдаётся в формате sing-box / outbounds)
+    name_key = None
+    for k in ("remarks", "tag"):
+        if isinstance(item.get(k), str) and item.get(k).strip():
+            name_key = k
+            break
+    if not name_key:
+        return item
+    orig_name = item[name_key]
+    if _is_redundant_auto(orig_name):
+        return None
+    p = _extract_proto_from_item(item)
+    new_item = dict(item)
+    new_item[name_key] = _clean_remark(orig_name, p)
+    return new_item
+
 def _clean_sub_body(body: bytes) -> bytes:
-    """Убирает дубли '· авто (...)' и заменяет упоминание оператора 'Билайн' на 'РФ' в JSON и vless:// подписках."""
+    """Убирает дубли '· авто (...)', форматирует метки Wi-Fi / Мобильная связь и сокращает страны на мобильных нодах."""
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         return body
 
     stripped = text.strip()
-    # 1. JSON-подписка (массив или объект Xray-конфигов для Happ)
+    # 1. JSON-подписка (массив или объект Xray / sing-box конфигов для Happ)
     if stripped.startswith(("[", "{")):
         try:
             data = json.loads(stripped)
             if isinstance(data, list):
                 out = []
                 for item in data:
-                    if isinstance(item, dict) and isinstance(item.get("remarks"), str):
-                        if _is_redundant_auto(item["remarks"]):
-                            continue
-                        item["remarks"] = _clean_remark(item["remarks"], _extract_proto_from_item(item))
-                    out.append(item)
+                    if isinstance(item, dict):
+                        res = _transform_json_node(item)
+                        if res is not None:
+                            out.append(res)
+                    else:
+                        out.append(item)
                 return json.dumps(out, ensure_ascii=False).encode("utf-8")
-            if isinstance(data, dict) and isinstance(data.get("remarks"), str):
-                data["remarks"] = _clean_remark(data["remarks"])
-                return json.dumps(data, ensure_ascii=False).encode("utf-8")
+            if isinstance(data, dict):
+                if isinstance(data.get("outbounds"), list):
+                    new_outbounds = []
+                    for item in data["outbounds"]:
+                        if isinstance(item, dict):
+                            res = _transform_json_node(item)
+                            if res is not None:
+                                new_outbounds.append(res)
+                        else:
+                            new_outbounds.append(item)
+                    data["outbounds"] = new_outbounds
+                    return json.dumps(data, ensure_ascii=False).encode("utf-8")
+                res = _transform_json_node(data)
+                if res is not None:
+                    return json.dumps(res, ensure_ascii=False).encode("utf-8")
         except Exception:
             logging.exception("clean_sub_body json failed")
             return body
