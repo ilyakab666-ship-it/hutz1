@@ -73,10 +73,9 @@ def _task_done(t: asyncio.Task):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.info("SQLite DB_PATH: %s", c.DB_PATH)
-    if c._http.is_closed:
-        c._http = c.httpx.AsyncClient(timeout=c.httpx.Timeout(30, connect=10), follow_redirects=True)
     try:
         synced = await c.sync_from_h1()
+        logging.info("H1 sync on startup: %s", synced)
     except Exception:
         logging.exception("sync_from_h1")
     try: await setup_commands()

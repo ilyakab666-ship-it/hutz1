@@ -40,6 +40,10 @@ class AdmSt(StatesGroup):
     pc_discount = State()
     pc_code = State()
     pc_qty = State()
+    ref_tag = State()
+    ref_title = State()
+    ref_pct = State()
+    ref_pay = State()
 
 # ---------- хелперы ----------
 def fmt(b): return f"{b / c.GB:.2f} ГБ"
@@ -118,8 +122,8 @@ KB_SUPPORT = Kb(inline_keyboard=[[Btn(text="🆘 Поддержка", url=c.SUPP
 
 BACK = Btn(text="◀️ Назад", callback_data="menu")
 
-async def _ensure_synced(tg_id: int, username: str | None = None):
-    u = c.ensure_user(tg_id, username)
+async def _ensure_synced(tg_id: int, username: str | None = None, ref_source: str | None = None):
+    u = c.ensure_user(tg_id, username, ref_source=ref_source)
     if u["status"] == "new":
         try:
             u = await c.sync_user_from_h1(tg_id)
@@ -128,9 +132,9 @@ async def _ensure_synced(tg_id: int, username: str | None = None):
     return u
 
 @router.message(Command("start"))
-async def start(m: Message, state: FSMContext):
+async def start(m: Message, state: FSMContext, command: CommandObject):
     await state.clear()
-    await _ensure_synced(m.from_user.id, m.from_user.username)
+    await _ensure_synced(m.from_user.id, m.from_user.username, ref_source=command.args)
     await m.answer("👇 Кнопки быстрого доступа — внизу экрана", reply_markup=KB_REPLY)
     await m.answer(welcome(), reply_markup=kb_main())
 
@@ -531,6 +535,7 @@ def list_view(page: int) -> tuple[str, Kb]:
           ([Btn(text="▶️", callback_data=f"adm:l:{page + 1}")] if page < pages - 1 else [])
     kb.append(nav)
     kb.append([Btn(text="🔍 Найти пользователя", callback_data="adm:find")])
+    kb.append([Btn(text="📊 Реклама и партнёры", callback_data="adm:rf:0")])
     kb.append([Btn(text="🎟 Генератор промокодов", callback_data="adm:pg")])
     kb.append([Btn(text="📣 Рассылка", callback_data="adm:bc"), Btn(text="🧪 Тест (1 ₽)", callback_data="adm:testpay")])
     kb.append([Btn(text="🔄 Синхр. H1", callback_data="adm:sync"), Btn(text="💾 Бэкап БД", callback_data="adm:backup")])
@@ -554,7 +559,8 @@ async def card_view(tg_id: int) -> tuple[str, Kb]:
     text = (f"👤 <b>{html.escape(label(u).split(' · ')[0])}</b> · <code>{tg_id}</code>\n"
             f"Статус: {u['status']} / {u['plan']}\nТрафик: {used} / {fmt(u['limit_bytes'])}\n"
             f"Осталось: {left}\nУстройства: {len(c.devices_of(u))}/{u['device_limit']}\n"
-            f"Создан: {date(u['created_at'])}")
+            f"Создан: {date(u['created_at'])}"
+            + (f"\nИсточник: <code>ref_{html.escape(u['ref_source'])}</code>" if u["ref_source"] else ""))
     devs = c.device_list(u)
     if devs:
         text += "\n\n📱 <b>Устройства:</b>\n" + "\n".join(
@@ -793,6 +799,176 @@ async def pc_code_text(m: Message, state: FSMContext):
         return await m.answer("❌ Код должен содержать от 3 до 32 латинских букв/цифр (например <code>SALE20</code>).")
     await _pc_ask_qty(m, state, code)
 
+
+# ---------- реклама и партнёрская статистика ----------
+_bot_username_cache: str | None = None
+
+async def _get_bot_username() -> str:
+    global _bot_username_cache
+    if not _bot_username_cache:
+        me = await bot.get_me()
+        _bot_username_cache = me.username or "hutzvpn_bot"
+    return _bot_username_cache
+
+def ref_list_view(page: int) -> tuple[str, Kb]:
+    stats = c.get_ref_stats()
+    tot_u = sum(s["total_u"] for s in stats)
+    tot_b = sum(s["buyers"] for s in stats)
+    tot_rev = sum(s["revenue"] for s in stats)
+    tot_due = sum(s["due"] for s in stats)
+
+    all_rev = c.db.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='paid' AND plan_key!='test1'").fetchone()[0]
+    org_u = c.db.execute("SELECT COUNT(*) FROM users WHERE ref_source IS NULL OR ref_source=''").fetchone()[0]
+
+    header = (
+        f"📊 <b>Реклама и партнёрская статистика</b>\n\n"
+        f"• По меткам пришло: <b>{tot_u}</b> чел. (органика: {org_u})\n"
+        f"• Покупателей с рекламы: <b>{tot_b}</b>\n"
+        f"• Выручка с рекламы: <b>{tot_rev} ₽</b> (всего в кассе: {all_rev} ₽)\n"
+        f"• К выплате партнёрам: <b>{tot_due} ₽</b>\n"
+    )
+    if not stats:
+        header += "\n<i>Рекламных меток пока нет. Нажмите «➕ Создать метку», чтобы получить ссылку для блогера.</i>"
+        kb = [
+            [Btn(text="➕ Создать рекламную метку", callback_data="adm:rfnew")],
+            [Btn(text="◀️ В админку", callback_data="adm:l:0")],
+        ]
+        return header, Kb(inline_keyboard=kb)
+
+    per = 6
+    pages = max(1, -(-len(stats) // per))
+    page = min(max(page, 0), pages - 1)
+    kb = []
+    for s in stats[page * per:(page + 1) * per]:
+        title_part = f" ({s['title']})" if s["title"] else ""
+        rs_part = f" · {s['revshare_pct']}%" if s["revshare_pct"] else ""
+        btn_text = f"📌 {s['tag']}{title_part}: {s['total_u']} чел / {s['revenue']} ₽{rs_part}"
+        kb.append([Btn(text=btn_text[:60], callback_data=f"adm:rfv:{s['tag']}:{page}")])
+
+    if pages > 1:
+        nav = ([Btn(text="◀️", callback_data=f"adm:rf:{page - 1}")] if page else []) + \
+              [Btn(text=f"{page + 1}/{pages}", callback_data="adm:noop")] + \
+              ([Btn(text="▶️", callback_data=f"adm:rf:{page + 1}")] if page < pages - 1 else [])
+        kb.append(nav)
+
+    kb.append([Btn(text="➕ Создать рекламную метку", callback_data="adm:rfnew")])
+    kb.append([Btn(text="🔄 Обновить", callback_data=f"adm:rf:{page}"), Btn(text="◀️ В админку", callback_data="adm:l:0")])
+    return header, Kb(inline_keyboard=kb)
+
+async def ref_card_view(tag: str, page: int = 0) -> tuple[str, Kb]:
+    items = c.get_ref_stats(tag)
+    back = [Btn(text="◀️ К списку меток", callback_data=f"adm:rf:{page}")]
+    if not items:
+        return "Метка не найдена.", Kb(inline_keyboard=[back])
+    s = items[0]
+    uname = await _get_bot_username()
+    link = f"https://t.me/{uname}?start=ref_{s['tag']}"
+
+    recent = c.db.execute(
+        "SELECT p.amount, p.plan_key, p.paid_at, u.tg_id, u.username "
+        "FROM payments p JOIN users u ON p.tg_id=u.tg_id "
+        "WHERE u.ref_source=? AND p.status='paid' AND p.plan_key!='test1' "
+        "ORDER BY p.paid_at DESC LIMIT 5", (s["tag"],)
+    ).fetchall()
+
+    title_line = f" ({html.escape(s['title'])})" if s["title"] else ""
+    model_line = f"RevShare <b>{s['revshare_pct']}%</b>" if s["revshare_pct"] > 0 else "Фикс / Без процента (0%)"
+    text = (
+        f"📌 <b>Метка: {html.escape(s['tag'])}</b>{title_line}\n"
+        f"Модель: {model_line}\n\n"
+        f"🔗 <b>Ссылка для поста (нажми чтобы скопировать):</b>\n"
+        f"<code>{link}</code>\n\n"
+        f"📈 <b>Воронка трафика:</b>\n"
+        f"• Запустили бота (/start): <b>{s['total_u']}</b>\n"
+        f"• Активировали тест / ключ: <b>{s['activated_u']}</b>\n"
+        f"• Купили подписку (уник.): <b>{s['buyers']}</b> (конверсия <b>{s['conv']}%</b>)\n"
+        f"• Всего оплат (с продлениями): <b>{s['orders']}</b>\n\n"
+        f"💰 <b>Финансы:</b>\n"
+        f"• Общая выручка: <b>{s['revenue']} ₽</b>\n"
+    )
+    if s["revshare_pct"] > 0:
+        text += (
+            f"• Доля партнёра ({s['revshare_pct']}%): <b>{s['earned']} ₽</b>\n"
+            f"• Уже выплачено: <b>{s['paid_out_rub']} ₽</b>\n"
+            f"• <b>К выплате сейчас: {s['due']} ₽</b>\n"
+            f"• Чистыми в кассу: <b>{s['net']} ₽</b>\n"
+        )
+    if recent:
+        text += "\n🧾 <b>Последние оплаты:</b>\n"
+        for r in recent:
+            who = f"@{r['username']}" if r["username"] else str(r["tg_id"])
+            text += f"• {date(r['paid_at'])} — {html.escape(who)}: <b>{r['amount']} ₽</b> ({r['plan_key']})\n"
+
+    kb = [
+        [Btn(text="💸 Отметить выплату партнёру", callback_data=f"adm:rfpay:{s['tag']}:{page}")],
+        [Btn(text="⚙️ Изменить % / название", callback_data=f"adm:rfedit:{s['tag']}:{page}")],
+        [Btn(text="🗑 Удалить метку", callback_data=f"adm:rfdel:{s['tag']}:{page}")],
+        back,
+    ]
+    return text, Kb(inline_keyboard=kb)
+
+@router.message(AdmSt.ref_tag, admin, F.text, ~F.text.startswith("/"))
+async def ref_tag_step(m: Message, state: FSMContext):
+    tag = c.norm_ref_tag(m.text)
+    if len(tag) < 2:
+        return await m.answer("❌ Минимум 2 символа (латиница, цифры, <code>_</code> или <code>-</code>). Попробуйте снова:")
+    await state.update_data(ref_tag=tag)
+    await state.set_state(AdmSt.ref_title)
+    kb = Kb(inline_keyboard=[
+        [Btn(text="⏭ Пропустить", callback_data="adm:rfskip_title")],
+        [Btn(text="✖️ Отмена", callback_data="adm:rf:0")],
+    ])
+    await m.answer(
+        f"📌 Метка: <code>{tag}</code>\n\n"
+        "<b>Шаг 2:</b> Введите название канала или заметку для себя (например <code>@durov_news</code> или <code>УБТ TikTok #1</code>):",
+        reply_markup=kb,
+    )
+
+@router.message(AdmSt.ref_title, admin, F.text, ~F.text.startswith("/"))
+async def ref_title_step(m: Message, state: FSMContext):
+    await state.update_data(ref_title=m.text.strip()[:80])
+    await state.set_state(AdmSt.ref_pct)
+    kb = Kb(inline_keyboard=[
+        [Btn(text="0% (Фикс)", callback_data="adm:rfpct:0"),
+         Btn(text="30%", callback_data="adm:rfpct:30"),
+         Btn(text="40% (RevShare)", callback_data="adm:rfpct:40"),
+         Btn(text="50%", callback_data="adm:rfpct:50")],
+        [Btn(text="✖️ Отмена", callback_data="adm:rf:0")],
+    ])
+    await m.answer(
+        "<b>Шаг 3:</b> Выберите процент RevShare для партнёра (или введите число от 0 до 100):",
+        reply_markup=kb,
+    )
+
+@router.message(AdmSt.ref_pct, admin, F.text, ~F.text.startswith("/"))
+async def ref_pct_step(m: Message, state: FSMContext):
+    raw = m.text.strip().rstrip("%").strip()
+    try:
+        pct = int(raw)
+    except ValueError:
+        return await m.answer("❌ Введите число от 0 до 100 (например <code>40</code> или <code>0</code>).")
+    if not (0 <= pct <= 100):
+        return await m.answer("❌ Процент должен быть от 0 до 100.")
+    d = await state.get_data()
+    await state.clear()
+    tag = c.upsert_ref_campaign(d["ref_tag"], d.get("ref_title", ""), pct)
+    text, kb = await ref_card_view(tag, 0)
+    await m.answer(f"✅ <b>Рекламная метка сохранена!</b>\n\n{text}", reply_markup=kb)
+
+@router.message(AdmSt.ref_pay, admin, F.text, ~F.text.startswith("/"))
+async def ref_pay_step(m: Message, state: FSMContext):
+    try:
+        amt = int(m.text.strip())
+    except ValueError:
+        return await m.answer("❌ Введите сумму выплаты в рублях целым числом (например <code>1500</code>).")
+    d = await state.get_data()
+    await state.clear()
+    tag = d["ref_pay_tag"]
+    page = d.get("ref_pay_page", 0)
+    c.record_ref_payout(tag, amt)
+    text, kb = await ref_card_view(tag, page)
+    await m.answer(f"✅ Записана выплата <b>{amt} ₽</b> по метке <code>{tag}</code>.\n\n{text}", reply_markup=kb)
+
 @router.message(AdmSt.pc_qty, admin, F.text, ~F.text.startswith("/"))
 async def pc_qty_text(m: Message, state: FSMContext):
     try: qty = int(m.text.strip())
@@ -812,6 +988,32 @@ async def adm(q: CallbackQuery, state: FSMContext):
         await show(q, "🔍 Отправьте числовой <b>TG ID</b> или <b>@username</b> пользователя.",
                    Kb(inline_keyboard=[[Btn(text="◀️ К списку", callback_data="adm:l:0")]]))
         return await safe_answer(q)
+    if act == "rfnew":
+        await state.set_state(AdmSt.ref_tag)
+        await show(q, "➕ <b>Новая рекламная метка</b>\n\n"
+                      "<b>Шаг 1:</b> Введите короткое имя метки латиницей (например <code>tgk_ai</code>, <code>shorts1</code> или <code>ivan_vpn</code>):",
+                   Kb(inline_keyboard=[[Btn(text="✖️ Отмена", callback_data="adm:rf:0")]]))
+        return await safe_answer(q)
+    if act == "rfskip_title":
+        await state.update_data(ref_title="")
+        await state.set_state(AdmSt.ref_pct)
+        kb = Kb(inline_keyboard=[
+            [Btn(text="0% (Фикс)", callback_data="adm:rfpct:0"),
+             Btn(text="30%", callback_data="adm:rfpct:30"),
+             Btn(text="40% (RevShare)", callback_data="adm:rfpct:40"),
+             Btn(text="50%", callback_data="adm:rfpct:50")],
+            [Btn(text="✖️ Отмена", callback_data="adm:rf:0")],
+        ])
+        await show(q, "<b>Шаг 3:</b> Выберите процент RevShare для партнёра (или введите число от 0 до 100):", kb)
+        return await safe_answer(q)
+    if act == "rfpct":
+        pct = int(p[2])
+        d = await state.get_data()
+        await state.clear()
+        tag = c.upsert_ref_campaign(d["ref_tag"], d.get("ref_title", ""), pct)
+        text, kb = await ref_card_view(tag, 0)
+        await show(q, f"✅ <b>Рекламная метка сохранена!</b>\n\n{text}", kb)
+        return await safe_answer(q, "Сохранено")
     if act == "bc":
         if _bc_running:
             return await safe_answer(q, "⏳ Предыдущая рассылка ещё идёт, дождитесь завершения.", show_alert=True)
@@ -886,6 +1088,33 @@ async def adm(q: CallbackQuery, state: FSMContext):
         text, kb = active_promos_view(); await show(q, text, kb); return await safe_answer(q, f"Удалён: {code}")
     if act == "l":
         text, kb = list_view(int(p[2])); await show(q, text, kb); return await safe_answer(q)
+    if act == "rf":
+        text, kb = ref_list_view(int(p[2])); await show(q, text, kb); return await safe_answer(q)
+    if act == "rfv":
+        tag, pg = p[2], int(p[3]) if len(p) > 3 else 0
+        text, kb = await ref_card_view(tag, pg); await show(q, text, kb); return await safe_answer(q)
+    if act == "rfedit":
+        tag = p[2]
+        await state.set_state(AdmSt.ref_title)
+        await state.update_data(ref_tag=tag)
+        kb = Kb(inline_keyboard=[
+            [Btn(text="⏭ Оставить без названия", callback_data="adm:rfskip_title")],
+            [Btn(text="✖️ Отмена", callback_data=f"adm:rfv:{tag}:0")],
+        ])
+        await show(q, f"⚙️ Редактирование метки <code>{tag}</code>\n\nВведите новое название канала/заметку:", kb)
+        return await safe_answer(q)
+    if act == "rfpay":
+        tag, pg = p[2], int(p[3]) if len(p) > 3 else 0
+        await state.set_state(AdmSt.ref_pay)
+        await state.update_data(ref_pay_tag=tag, ref_pay_page=pg)
+        await show(q, f"💸 <b>Учёт выплаты по метке <code>{tag}</code></b>\n\n"
+                      "Введите сумму в рублях, которую вы перевели партнёру (например <code>1200</code>):",
+                   Kb(inline_keyboard=[[Btn(text="✖️ Отмена", callback_data=f"adm:rfv:{tag}:{pg}")]]))
+        return await safe_answer(q)
+    if act == "rfdel":
+        tag, pg = p[2], int(p[3]) if len(p) > 3 else 0
+        c.delete_ref_campaign(tag)
+        text, kb = ref_list_view(pg); await show(q, text, kb); return await safe_answer(q, f"Метка {tag} удалена")
     if act == "sync":
         try:
             st = await c.sync_from_h1()

@@ -102,9 +102,17 @@ def _init_db():
       status TEXT NOT NULL DEFAULT 'pending',      -- pending | paid | failed
       rp_payment_id TEXT, pay_url TEXT, created_at INTEGER, paid_at INTEGER);
     """)
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS ref_campaigns(
+      tag TEXT PRIMARY KEY,
+      title TEXT DEFAULT '',
+      revshare_pct INTEGER DEFAULT 0,
+      paid_out_rub INTEGER DEFAULT 0,
+      created_at INTEGER);
+    """)
     for _ddl in ("username TEXT", "devices TEXT DEFAULT '[]'", "device_limit INTEGER DEFAULT 1",
                  "notified_exp INTEGER DEFAULT 0", "notified_traffic INTEGER DEFAULT 0",
-                 "discount_pct INTEGER DEFAULT 0", "discount_code TEXT"):
+                 "discount_pct INTEGER DEFAULT 0", "discount_code TEXT", "ref_source TEXT"):
         try: db.execute(f"ALTER TABLE users ADD COLUMN {_ddl}")   # автомиграция старых БД
         except sqlite3.OperationalError: pass
     for _ddl in ("kind TEXT DEFAULT 'days'", "discount_pct INTEGER DEFAULT 0",
@@ -175,15 +183,104 @@ def devices_of(u) -> list[str]:
     try: return list(json.loads(u["devices"] or "[]"))
     except ValueError: return []
 
-def ensure_user(tg_id, username=None):
+def norm_ref_tag(raw: str | None) -> str:
+    if not raw:
+        return ""
+    t = re.sub(r"[^a-zA-Z0-9_-]", "", raw.strip()).lower()
+    if t.startswith("ref_"):
+        t = t[4:]
+    return t[:32]
+
+def ensure_user(tg_id, username=None, ref_source: str | None = None):
     u = get_user(tg_id)
+    tag = norm_ref_tag(ref_source)
     if not u:
-        db.execute("INSERT INTO users(tg_id,token,created_at,username,device_limit) VALUES(?,?,?,?,?)",
-                   (tg_id, secrets.token_urlsafe(16), now(), username, DEFAULT_DEVICES))
+        db.execute("INSERT INTO users(tg_id,token,created_at,username,device_limit,ref_source) VALUES(?,?,?,?,?,?)",
+                   (tg_id, secrets.token_urlsafe(16), now(), username, DEFAULT_DEVICES, tag or None))
+        if tag:
+            db.execute("INSERT OR IGNORE INTO ref_campaigns(tag,title,revshare_pct,paid_out_rub,created_at) VALUES(?,?,?,?,?)",
+                       (tag, "", 0, 0, now()))
         db.commit()
     elif username and u["username"] != username:
         db.execute("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id)); db.commit()
     return get_user(tg_id)
+
+def upsert_ref_campaign(raw_tag: str, title: str = "", revshare_pct: int = 0) -> str:
+    tag = norm_ref_tag(raw_tag)
+    if len(tag) < 2:
+        raise ValueError("Метка должна содержать минимум 2 символа (латиница, цифры, _ или -).")
+    pct = max(0, min(100, int(revshare_pct)))
+    row = db.execute("SELECT tag FROM ref_campaigns WHERE tag=?", (tag,)).fetchone()
+    if row:
+        db.execute("UPDATE ref_campaigns SET title=?, revshare_pct=? WHERE tag=?", (title.strip()[:80], pct, tag))
+    else:
+        db.execute("INSERT INTO ref_campaigns(tag,title,revshare_pct,paid_out_rub,created_at) VALUES(?,?,?,?,?)",
+                   (tag, title.strip()[:80], pct, 0, now()))
+    db.commit()
+    return tag
+
+def record_ref_payout(tag: str, amount_rub: int):
+    tag = norm_ref_tag(tag)
+    db.execute("UPDATE ref_campaigns SET paid_out_rub = MAX(0, COALESCE(paid_out_rub, 0) + ?) WHERE tag=?",
+               (int(amount_rub), tag))
+    db.commit()
+
+def delete_ref_campaign(tag: str):
+    tag = norm_ref_tag(tag)
+    db.execute("DELETE FROM ref_campaigns WHERE tag=?", (tag,))
+    db.commit()
+
+def get_ref_stats(tag: str | None = None) -> list[dict]:
+    campaigns = {r["tag"]: dict(r) for r in db.execute("SELECT * FROM ref_campaigns").fetchall()}
+    user_tags = [r[0] for r in db.execute(
+        "SELECT DISTINCT ref_source FROM users WHERE ref_source IS NOT NULL AND ref_source!=''"
+    ).fetchall()]
+    all_tags = set(campaigns.keys()) | set(user_tags)
+    if tag:
+        t = norm_ref_tag(tag)
+        all_tags = {t} if t in all_tags else set()
+
+    out = []
+    for t in all_tags:
+        meta = campaigns.get(t, {"tag": t, "title": "", "revshare_pct": 0, "paid_out_rub": 0, "created_at": 0})
+        u_row = db.execute(
+            "SELECT COUNT(*) AS total_u, "
+            "SUM(CASE WHEN status!='new' OR (key_id IS NOT NULL AND key_id!='') THEN 1 ELSE 0 END) AS activated_u "
+            "FROM users WHERE ref_source=?", (t,)
+        ).fetchone()
+        p_row = db.execute(
+            "SELECT COUNT(DISTINCT p.tg_id) AS buyers, COUNT(*) AS orders, COALESCE(SUM(p.amount), 0) AS revenue "
+            "FROM payments p JOIN users u ON p.tg_id = u.tg_id "
+            "WHERE u.ref_source=? AND p.status='paid' AND p.plan_key!='test1'", (t,)
+        ).fetchone()
+        total_u = u_row["total_u"] or 0
+        activated_u = u_row["activated_u"] or 0
+        buyers = p_row["buyers"] or 0
+        orders = p_row["orders"] or 0
+        revenue = p_row["revenue"] or 0
+        pct = int(meta.get("revshare_pct") or 0)
+        earned = round(revenue * pct / 100)
+        paid_out = int(meta.get("paid_out_rub") or 0)
+        due = max(0, earned - paid_out)
+        conv = round((buyers / total_u * 100), 1) if total_u > 0 else 0.0
+        out.append({
+            "tag": t,
+            "title": meta.get("title") or "",
+            "revshare_pct": pct,
+            "paid_out_rub": paid_out,
+            "created_at": meta.get("created_at") or 0,
+            "total_u": total_u,
+            "activated_u": activated_u,
+            "buyers": buyers,
+            "orders": orders,
+            "revenue": revenue,
+            "earned": earned,
+            "due": due,
+            "net": revenue - earned,
+            "conv": conv,
+        })
+    out.sort(key=lambda x: (x["revenue"], x["total_u"], x["created_at"]), reverse=True)
+    return out
 
 # ---------- панель H1 ----------
 class H1Error(Exception):
