@@ -91,20 +91,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def _extract_proto_from_item(item) -> str:
+_PROTO_NOISE = {"vless", "vmess", "trojan", "shadowsocks", "ss", "hysteria2", "outbounds", "inbounds",
+                "freedom", "blackhole", "dns", "direct", "block", "selector", "urltest"}
+
+def _extract_proto_from_item(item, depth: int = 0) -> str:
+    """Ищет транспорт (network/grpc/xhttp/tcp…) рекурсивно, включая списки outbounds[]."""
+    if depth > 6:
+        return ""
+    if isinstance(item, list):
+        for el in item:
+            p = _extract_proto_from_item(el, depth + 1)
+            if p:
+                return p
+        return ""
     if not isinstance(item, dict):
         return ""
     for k in ("network", "net", "transport", "type"):
         v = item.get(k)
-        if isinstance(v, str) and v.strip() and v.strip().lower() not in ("vless", "vmess", "trojan", "shadowsocks", "ss", "hysteria2", "outbounds", "inbounds"):
+        if isinstance(v, str) and v.strip() and v.strip().lower() not in _PROTO_NOISE:
             return v.strip().lower()
-    for container_key in (
-        "streamSettings", "stream_settings", "outbound", "xray",
-        "config", "settings", "transportSettings", "transport_settings", "transport"
-    ):
-        sub = item.get(container_key)
-        if isinstance(sub, dict):
-            p = _extract_proto_from_item(sub)
+        if isinstance(v, dict) and isinstance(v.get("type"), str):
+            return v["type"].strip().lower()
+    if "grpcSettings" in item or "grpc_settings" in item:
+        return "grpc"
+    for sub in item.values():
+        if isinstance(sub, (dict, list)):
+            p = _extract_proto_from_item(sub, depth + 1)
             if p:
                 return p
     return ""
@@ -117,6 +129,14 @@ def _extract_proto_from_uri(base_uri: str, remark: str = "") -> str:
     if m2:
         return m2.group(1).strip().lower()
     return ""
+
+_COUNTRY_ISO = {
+    "нидерланды": "NL", "финляндия": "FI", "германия": "DE", "швеция": "SE", "эстония": "EE",
+    "польша": "PL", "сша": "US", "латвия": "LV", "литва": "LT", "франция": "FR", "казахстан": "KZ",
+    "турция": "TR", "великобритания": "GB", "швейцария": "CH", "австрия": "AT", "чехия": "CZ",
+    "армения": "AM", "грузия": "GE", "сербия": "RS", "болгария": "BG", "румыния": "RO",
+    "норвегия": "NO", "испания": "ES", "италия": "IT", "япония": "JP", "сингапур": "SG",
+}
 
 def _clean_remark(name: str, proto: str = "") -> str:
     s = name.strip()
@@ -140,13 +160,8 @@ def _clean_remark(name: str, proto: str = "") -> str:
     s = re.sub(r"\s*[|/-]?\s*\(?\s*(?:wi-?fi|вайфай)\s*\)?", "", s, flags=re.I)
 
     if is_mobile:
-        s = re.sub(r"\bнидерланды\b", "NL", s, flags=re.I)
-        s = re.sub(r"\bфинляндия\b", "FI", s, flags=re.I)
-        s = re.sub(r"\bгермания\b", "DE", s, flags=re.I)
-        s = re.sub(r"\bшвеция\b", "SE", s, flags=re.I)
-        s = re.sub(r"\bэстония\b", "EE", s, flags=re.I)
-        s = re.sub(r"\bпольша\b", "PL", s, flags=re.I)
-        s = re.sub(r"\bсша\b", "US", s, flags=re.I)
+        for ru, iso in _COUNTRY_ISO.items():
+            s = re.sub(rf"(?<!\w){ru}(?!\w)", iso, s, flags=re.I)
         s = re.sub(r"билайн\s*\(через\s*москву\)", "Мобильная связь", s, flags=re.I)
         s = re.sub(r"\(через\s*москву\)", "", s, flags=re.I)
         s = re.sub(r"билайн", "Мобильная связь", s, flags=re.I)
@@ -234,7 +249,7 @@ def _clean_sub_body(body: bytes) -> bytes:
     if is_b64:
         try:
             pad = "=" * (-len(stripped) % 4)
-            raw_lines_text = base64.b64decode(stripped + pad).decode("utf-8")
+            raw_lines_text = base64.b64decode((stripped + pad).replace("-", "+").replace("_", "/")).decode("utf-8")
         except Exception:
             return body
 
