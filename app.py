@@ -260,19 +260,9 @@ _INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.ht
 
 @app.get("/", include_in_schema=False)
 async def landing():
-    return FileResponse(_INDEX_HTML)
-
-
-if __name__ == "__main__":   # python app.py — то же, что uvicorn app:app (на Bothost запускается именно так)
-    import os, uvicorn
-    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")))
-
-
-_INDEX_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-
-@app.get("/", include_in_schema=False)
-async def landing():
-    return FileResponse(_INDEX_HTML)
+    if os.path.isfile(_INDEX_HTML):
+        return FileResponse(_INDEX_HTML)
+    return PlainTextResponse("index.html не найден", status_code=404)
 
 
 if __name__ == "__main__":   # python app.py — то же, что uvicorn app:app (на Bothost запускается именно так)
