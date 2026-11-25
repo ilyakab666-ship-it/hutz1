@@ -92,13 +92,36 @@ app = FastAPI(lifespan=lifespan)
 
 
 def _clean_remark(name: str) -> str:
-    # "Нидерланды #1 · Билайн (через Москву)" -> "NL #1 · Мобильная связь" (23 символа)
-    if re.search(r"билайн|через\s*москву", name, flags=re.I):
-        name = re.sub(r"нидерланды", "NL", name, flags=re.I)
-        name = re.sub(r"билайн\s*\(через\s*москву\)", "Мобильная связь", name, flags=re.I)
-        name = re.sub(r"\(через\s*москву\)", "", name, flags=re.I)
-        name = re.sub(r"билайн", "Мобильная связь", name, flags=re.I)
-    return re.sub(r"\s{2,}", " ", name).strip()
+    s = name.strip()
+    is_mobile = bool(re.search(r"мобильн\w*\s*связ\w*|билайн|через\s*москву|\bmob\b", s, flags=re.I))
+
+    if is_mobile:
+        # Укорачиваем название страны до 2 букв, чтобы на экране телефона не обрезалось "Мобильная связь"
+        s = re.sub(r"\bнидерланды\b", "NL", s, flags=re.I)
+        s = re.sub(r"\bфинляндия\b", "FI", s, flags=re.I)
+        s = re.sub(r"\bгермания\b", "DE", s, flags=re.I)
+        s = re.sub(r"\bшвеция\b", "SE", s, flags=re.I)
+        s = re.sub(r"\bэстония\b", "EE", s, flags=re.I)
+        s = re.sub(r"\bпольша\b", "PL", s, flags=re.I)
+        s = re.sub(r"\bсша\b", "US", s, flags=re.I)
+        # Убираем приписку (Wi-Fi) / Wi-Fi из мобильных нод
+        s = re.sub(r"\s*[·|/-]?\s*\(?\s*wi-?fi\s*\)?", "", s, flags=re.I)
+        s = re.sub(r"билайн\s*\(через\s*москву\)", "Мобильная связь", s, flags=re.I)
+        s = re.sub(r"\(через\s*москву\)", "", s, flags=re.I)
+        s = re.sub(r"билайн", "Мобильная связь", s, flags=re.I)
+        s = re.sub(r"\bмобильная\s+связь\b", "Мобильная связь", s, flags=re.I)
+        if "мобильная связь" not in s.lower():
+            s = f"{s} · Мобильная связь"
+    else:
+        # Обычные ноды для Wi-Fi: если нет пометки Wi-Fi и это не "Автовыбор", добавляем "· Wi-Fi"
+        if s.lower() != "автовыбор" and not re.search(r"wi-?fi|вайфай", s, flags=re.I):
+            s = f"{s} · Wi-Fi"
+
+    # Чистим лишние разделители и пробелы
+    s = re.sub(r"\s*[·|]\s*[·|]\s*", " · ", s)
+    s = re.sub(r"\(\s*\)", "", s)
+    s = re.sub(r"\s{2,}", " ", s).strip(" ·-")
+    return s
 
 def _is_redundant_auto(name: str) -> bool:
     low = name.lower()
@@ -199,7 +222,7 @@ async def sub(token: str, request: Request):
     hdrs["profile-title"] = os.getenv("HAPP_TITLE", c.BRAND).strip()[:25]
     hdrs["support-url"] = c.SUPPORT_URL           # иконка поддержки внутри Happ
     hdrs["profile-update-interval"] = "1"         # автообновление раз в час
-    ann = os.getenv("HAPP_ANNOUNCE", "💡 На моб. интернете выберите «NL · Мобильная связь»").strip()
+    ann = os.getenv("HAPP_ANNOUNCE", "💡 Мобильный интернет → «Мобильная связь» · Wi-Fi → «Wi-Fi»").strip()
     if ann:
         hdrs["announce"] = "base64:" + base64.b64encode(ann.encode("utf-8")).decode()
         hdrs["announce-url"] = c.SUPPORT_URL
